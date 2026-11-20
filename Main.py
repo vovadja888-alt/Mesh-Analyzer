@@ -1,3 +1,4 @@
+import multiprocessing
 import controller
 import view_ctk
 
@@ -9,4 +10,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
