@@ -1,0 +1,31 @@
+{
+  "project_name": "Coursework 3D Validation",
+  "rules": [
+    {
+      "type": "DuplicateVertexRule",
+      "tolerance": 1e-06
+    },
+    {
+      "type": "DegenerateFaceRule",
+      "tolerance": 1e-06
+    },
+    {
+      "type": "NormalRule",
+      "tolerance": 1e-06
+    }
+  ],
+  "models": [
+    {
+      "name": "6 model cube.obj",
+      "path": "C:/Users/я/Desktop/курсовая приложение/моделі тест/6 model cube.obj",
+      "vertices_count": 388,
+      "errors_count": 8
+    },
+    {
+      "name": "1 model mouse.obj",
+      "path": "C:/Users/я/Desktop/курсовая приложение/моделі тест/1 model mouse.obj",
+      "vertices_count": 11893,
+      "errors_count": 2185
+    }
+  ]
+}
