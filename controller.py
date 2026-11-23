@@ -50,7 +50,7 @@ def _batch_model_worker(model_name: str, file_path: str, rules_cfg: list[dict]) 
 class MeshAnalyzerController:
     def __init__(self, storage_path: str = "projects.json"):
         self.storage = ProjectStorage(storage_path)
-        self.project: Project = self.storage.load_all()
+        self.project: Project = self.storage.load_all() or Project("Проєкт за замовчуванням")
         self.current_model: Model3D | None = self.project.models[0] if self.project.models else None
         self.cancel_event = threading.Event()
         self.result_queue: queue.Queue = queue.Queue()
