@@ -6,6 +6,7 @@ import customtkinter as ctk
 from controller import MeshAnalyzerController
 from domain_classes import DegenerateFaceRule, DuplicateVertexRule, NormalRule
 
+
 class ModelEditDialog(ctk.CTkToplevel):
     """Модальне вікно для додавання або редагування 3D-моделі у проєкті без запуску аналізу."""
 
@@ -71,10 +72,25 @@ class MeshAnalyzerView(ctk.CTk):
             except Exception:
                 pass
 
-        self.zoom_scale = 1.0
-        self.pan_x = 0.0
-        self.pan_y = 0.0
-        self._drag_start = (0, 0)
+        self.view_states: dict[str, dict] = {
+            "XY": {
+                "zoom": 1.0,
+                "pan_x": 0.0,
+                "pan_y": 0.0,
+                "drag_start": (0, 0),
+                "is_interacting": False,
+                "timer_id": None,
+            },
+            "XZ": {
+                "zoom": 1.0,
+                "pan_x": 0.0,
+                "pan_y": 0.0,
+                "drag_start": (0, 0),
+                "is_interacting": False,
+                "timer_id": None,
+            },
+        }
+
         self.highlighted_issue: tuple[str, int] | None = None
         self.sort_col = "name"
         self.sort_reverse = False
@@ -84,7 +100,6 @@ class MeshAnalyzerView(ctk.CTk):
         self._sync_project_ui()
         self.after(100, self._poll_queue)
 
-    # ==================== ВЕРХНЯ ПАНЕЛЬ ПРОЄКТІВ (МУЛЬТИПРОЄКТНІСТЬ) ====================
     def _build_top_project_bar(self) -> None:
         bar = ctk.CTkFrame(self)
         bar.pack(fill="x", padx=10, pady=(10, 5))
@@ -108,7 +123,6 @@ class MeshAnalyzerView(ctk.CTk):
         ctk.CTkButton(bar, text="Експорт JSON", width=105, command=self._on_export_json).pack(side="right", padx=(4, 10))
         ctk.CTkButton(bar, text="Імпорт JSON", width=105, command=self._on_import_json).pack(side="right", padx=4)
 
-    # ==================== ОСНОВНИЙ МАКЕТ ====================
     def _build_main_layout(self) -> None:
         container = ctk.CTkFrame(self, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=10, pady=5)
@@ -134,7 +148,6 @@ class MeshAnalyzerView(ctk.CTk):
             anchor="w", padx=8, pady=(6, 4)
         )
 
-        # 1. DuplicateVertexRule
         r1 = ctk.CTkFrame(box, fg_color="transparent")
         r1.pack(fill="x", padx=8, pady=2)
         self.var_dup = tk.BooleanVar(value=True)
@@ -143,7 +156,6 @@ class MeshAnalyzerView(ctk.CTk):
         self.entry_tol_dup = ctk.CTkEntry(r1, width=95)
         self.entry_tol_dup.pack(side="left")
 
-        # 2. DegenerateFaceRule
         r2 = ctk.CTkFrame(box, fg_color="transparent")
         r2.pack(fill="x", padx=8, pady=2)
         self.var_deg = tk.BooleanVar(value=True)
@@ -152,7 +164,6 @@ class MeshAnalyzerView(ctk.CTk):
         self.entry_tol_deg = ctk.CTkEntry(r2, width=95)
         self.entry_tol_deg.pack(side="left")
 
-        # 3. NormalRule
         r3 = ctk.CTkFrame(box, fg_color="transparent")
         r3.pack(fill="x", padx=8, pady=2)
         self.var_norm = tk.BooleanVar(value=True)
@@ -289,19 +300,23 @@ class MeshAnalyzerView(ctk.CTk):
         self.canvas_xz = tk.Canvas(canv_box, bg="#141414", highlightthickness=1, highlightbackground="#333333")
         self.canvas_xz.pack(side="right", fill="both", expand=True, padx=(5, 0))
 
-        for cv in (self.canvas_xy, self.canvas_xz):
-            cv.bind("<MouseWheel>", self._on_zoom)
-            cv.bind("<ButtonPress-1>", self._on_pan_start)
-            cv.bind("<B1-Motion>", self._on_pan_move)
-            cv.bind("<Configure>", lambda _e: self._redraw_projections())
+        self.canvases: dict[str, tk.Canvas] = {
+            "XY": self.canvas_xy,
+            "XZ": self.canvas_xz,
+        }
+
+        for mode, cv in self.canvases.items():
+            cv.bind("<MouseWheel>", lambda e, m=mode: self._on_zoom(e, m))
+            cv.bind("<ButtonPress-1>", lambda e, m=mode: self._on_pan_start(e, m))
+            cv.bind("<B1-Motion>", lambda e, m=mode: self._on_pan_move(e, m))
+            cv.bind("<Configure>", lambda _e, m=mode: self._draw_single_canvas(self.canvases[m], m))
 
         legend = (
-            "Легенда: Сірі лінії - нормальні грані | Червоні лінії - пошкоджені грані | "
-            "Жовті точки - дублікати вершин (Коліщатко - зум, ЛКМ - переміщення)"
+            "Легенда: Сірі лінії - нормальні грані | Червоні лінії - дефектні грані | "
+            "Жовті точки - дублікати (Асинхронний зум/рух кожної панелі; під час руху малюються лише помилки)"
         )
         ctk.CTkLabel(parent, text=legend, text_color="#B0B0B0").pack(anchor="w", padx=10, pady=(2, 8))
 
-    # ==================== СИНХРОНІЗАЦІЯ UI ====================
     def _sync_project_ui(self) -> None:
         names = self.ctrl.get_project_names()
         self.combo_projects.configure(values=names)
@@ -358,7 +373,6 @@ class MeshAnalyzerView(ctk.CTk):
                 "", "end", iid=str(i), values=(f"#{iss.index}", iss.error_type, iss.severity, iss.description)
             )
 
-    # ==================== ОБРОБНИКИ ПОДІЙ ====================
     def _on_switch_project(self, selected_name: str) -> None:
         self.ctrl.switch_project(selected_name)
         self._sync_project_ui()
@@ -582,36 +596,64 @@ class MeshAnalyzerView(ctk.CTk):
             pass
         self.after(100, self._poll_queue)
 
-    # ==================== 2D-ВІЗУАЛІЗАЦІЯ ПРОЄКЦІЙ ====================
     def _reset_view(self) -> None:
-        self.zoom_scale = 1.0
-        self.pan_x = 0.0
-        self.pan_y = 0.0
+        for mode, st in self.view_states.items():
+            if st["timer_id"] is not None:
+                self.after_cancel(st["timer_id"])
+                st["timer_id"] = None
+            st["zoom"] = 1.0
+            st["pan_x"] = 0.0
+            st["pan_y"] = 0.0
+            st["is_interacting"] = False
         self._redraw_projections()
 
-    def _on_zoom(self, event) -> None:
+    def _schedule_full_render(self, mode: str, delay_ms: int = 200) -> None:
+        st = self.view_states[mode]
+        st["is_interacting"] = True
+        if st["timer_id"] is not None:
+            self.after_cancel(st["timer_id"])
+        st["timer_id"] = self.after(delay_ms, lambda m=mode: self._finish_interaction(m))
+
+    def _finish_interaction(self, mode: str) -> None:
+        st = self.view_states[mode]
+        st["is_interacting"] = False
+        st["timer_id"] = None
+        self._draw_single_canvas(self.canvases[mode], mode)
+
+    def _on_zoom(self, event, mode: str) -> None:
+        st = self.view_states[mode]
         factor = 1.15 if event.delta > 0 else 0.85
-        self.zoom_scale = max(0.2, min(15.0, self.zoom_scale * factor))
-        self._redraw_projections()
+        st["zoom"] = max(0.2, min(15.0, st["zoom"] * factor))
+        self._schedule_full_render(mode)
+        self._draw_single_canvas(self.canvases[mode], mode)
 
-    def _on_pan_start(self, event) -> None:
-        self._drag_start = (event.x, event.y)
+    def _on_pan_start(self, event, mode: str) -> None:
+        self.view_states[mode]["drag_start"] = (event.x, event.y)
 
-    def _on_pan_move(self, event) -> None:
-        self.pan_x += event.x - self._drag_start[0]
-        self.pan_y += event.y - self._drag_start[1]
-        self._drag_start = (event.x, event.y)
-        self._redraw_projections()
+    def _on_pan_move(self, event, mode: str) -> None:
+        st = self.view_states[mode]
+        dx = event.x - st["drag_start"][0]
+        dy = event.y - st["drag_start"][1]
+        st["pan_x"] += dx
+        st["pan_y"] += dy
+        st["drag_start"] = (event.x, event.y)
+        self._schedule_full_render(mode)
+        self._draw_single_canvas(self.canvases[mode], mode)
 
     def _redraw_projections(self) -> None:
-        self._draw_single_canvas(self.canvas_xy, mode="XY")
-        self._draw_single_canvas(self.canvas_xz, mode="XZ")
+        for mode, cv in self.canvases.items():
+            self._draw_single_canvas(cv, mode)
 
     def _draw_single_canvas(self, canvas: tk.Canvas, mode: str) -> None:
         canvas.delete("all")
         w = max(10, canvas.winfo_width())
         h = max(10, canvas.winfo_height())
-        canvas.create_text(12, 12, anchor="nw", text=f"Проєкція {mode}", fill="#CCCCCC", font=("Arial", 10, "bold"))
+
+        st = self.view_states[mode]
+        header = f"Проєкція {mode} ({st['zoom']:.2f}x)"
+        if st["is_interacting"]:
+            header += " [Оптимізація: лише дефекти]"
+        canvas.create_text(12, 12, anchor="nw", text=header, fill="#CCCCCC", font=("Arial", 10, "bold"))
 
         model = self.ctrl.current_model
         if model is None or not model.vertices:
@@ -623,28 +665,31 @@ class MeshAnalyzerView(ctk.CTk):
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
         span = max(max_x - min_x, max_y - min_y, 1e-6)
-        base_scale = (min(w, h) * 0.78) / span * self.zoom_scale
+        base_scale = (min(w, h) * 0.78) / span * st["zoom"]
         cx_mid = (min_x + max_x) * 0.5
         cy_mid = (min_y + max_y) * 0.5
+        pan_x = st["pan_x"]
+        pan_y = st["pan_y"]
 
         def to_screen(px: float, py: float) -> tuple[float, float]:
-            sx = w * 0.5 + (px - cx_mid) * base_scale + self.pan_x
-            sy = h * 0.5 - (py - cy_mid) * base_scale + self.pan_y
+            sx = w * 0.5 + (px - cx_mid) * base_scale + pan_x
+            sy = h * 0.5 - (py - cy_mid) * base_scale + pan_y
             return sx, sy
 
         bad_faces = {iss.index for iss in model.issues if iss.error_type != "DUPLICATE_VERTEX"}
         dup_verts = {iss.index for iss in model.issues if iss.error_type == "DUPLICATE_VERTEX"}
 
-        step = max(1, len(model.faces) // 15000)
-        for f_idx in range(0, len(model.faces), step):
-            if f_idx in bad_faces:
-                continue
-            face = model.faces[f_idx]
-            coords = []
-            for vi in face.vertex_indices:
-                coords.extend(to_screen(*pts_2d[vi]))
-            if len(coords) >= 6:
-                canvas.create_polygon(coords, outline="#3E444C", fill="", width=1)
+        if not st["is_interacting"]:
+            step = max(1, len(model.faces) // 15000)
+            for f_idx in range(0, len(model.faces), step):
+                if f_idx in bad_faces:
+                    continue
+                face = model.faces[f_idx]
+                coords = []
+                for vi in face.vertex_indices:
+                    coords.extend(to_screen(*pts_2d[vi]))
+                if len(coords) >= 6:
+                    canvas.create_polygon(coords, outline="#3E444C", fill="", width=1)
 
         for f_idx in bad_faces:
             if f_idx >= len(model.faces):
