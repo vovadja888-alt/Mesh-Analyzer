@@ -2,7 +2,7 @@ import json
 import os
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math_logic
 
 
@@ -409,11 +409,13 @@ class ProjectStorage:
             self.save_all()
             return default_proj
 
-        with open(self.storage_path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+        try:
+            with open(self.storage_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            raw = {}
 
-        # Підтримка зворотної сумісності зі старим однопроєктним JSON
-        if "projects" not in raw and "name" in raw:
+        if isinstance(raw, dict) and "projects" not in raw and "name" in raw:
             proj = Project.from_dict(raw)
             self.projects = {proj.name: proj}
             self.active_project_name = proj.name
@@ -421,15 +423,16 @@ class ProjectStorage:
             return proj
 
         self.projects.clear()
-        for p_data in raw.get("projects", []):
-            proj = Project.from_dict(p_data)
-            self.projects[proj.name] = proj
+        if isinstance(raw, dict):
+            for p_data in raw.get("projects", []):
+                proj = Project.from_dict(p_data)
+                self.projects[proj.name] = proj
 
         if not self.projects:
             default_proj = Project("Проєкт за замовчуванням")
             self.projects[default_proj.name] = default_proj
 
-        active_name = raw.get("active_project", "")
+        active_name = raw.get("active_project", "") if isinstance(raw, dict) else ""
         if active_name in self.projects:
             self.active_project_name = active_name
         else:
