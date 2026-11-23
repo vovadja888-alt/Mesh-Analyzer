@@ -56,7 +56,7 @@ class MeshAnalyzerController:
         self.result_queue: queue.Queue = queue.Queue()
         self._worker_thread: threading.Thread | None = None
 
-    # ==================== CRUD ПРОЄКТІВ ====================
+    #  CRUD ПРОЄКТІВ
     def get_project_names(self) -> list[str]:
         return list(self.storage.projects.keys())
 
@@ -103,7 +103,7 @@ class MeshAnalyzerController:
             json.dump(self.project.to_dict(), f, ensure_ascii=False, indent=2)
         logging.info("Експортовано проєкт «%s» у %s", self.project.name, json_path)
 
-    # ==================== CRUD ПРАВИЛ (ОКРЕМІ ДОПУСКИ) ====================
+    #CRUD ПРАВИЛ (ОКРЕМІ ДОПУСКИ)
     def update_rules(
         self,
         dup_enabled: bool,
@@ -125,7 +125,7 @@ class MeshAnalyzerController:
             dup_enabled, dup_tol, deg_enabled, deg_tol, norm_enabled, norm_tol,
         )
 
-    # ==================== CRUD МОДЕЛЕЙ БЕЗ ЗАПУСКУ АНАЛІЗУ ====================
+    # CRUD МОДЕЛЕЙ БЕЗ ЗАПУСКУ АНАЛІЗУ
     def add_model_without_analysis(self, file_path: str, custom_name: str | None = None) -> Model3D:
         if not file_path or not os.path.isfile(file_path):
             raise FileNotFoundError("Вкажіть існуючий файл формату .obj.")
@@ -161,7 +161,7 @@ class MeshAnalyzerController:
         self.current_model = model
         return model
 
-    # ==================== ПАРАЛЕЛЬНИЙ АНАЛІЗ ЧАСТИН ОДНІЄЇ МОДЕЛІ ====================
+    #ПАРАЛЕЛЬНИЙ АНАЛІЗ ЧАСТИН ОДНІЄЇ МОДЕЛІ 
     def start_analysis(self, file_path: str, model_name: str | None = None) -> None:
         if self._worker_thread and self._worker_thread.is_alive():
             raise RuntimeError("Аналіз уже виконується. Дочекайтеся завершення або натисніть «Скасувати».")
@@ -200,7 +200,6 @@ class MeshAnalyzerController:
             faces = raw_data["faces"]
             model_obj = Model3D(name=model_name, file_path=file_path, raw_data=raw_data)
 
-            # Розбиваємо геометрію моделі на частини (чанки) для паралельної обробки в ProcessPoolExecutor
             workers_count = min(4, max(1, os.cpu_count() or 2))
             if len(verts) < 2000 and len(faces) < 2000:
                 workers_count = 1
@@ -266,7 +265,7 @@ class MeshAnalyzerController:
             logging.exception("Помилка під час аналізу моделі %s", file_path)
             self.result_queue.put(("error", str(exc)))
 
-    # ==================== ПАРАЛЕЛЬНА ПЕРЕВІРКА ВСІХ МОДЕЛЕЙ ПРОЄКТУ ====================
+    # ПАРАЛЕЛЬНА ПЕРЕВІРКА ВСІХ МОДЕЛЕЙ ПРОЄКТУ
     def start_batch_project_analysis(self) -> None:
         if self._worker_thread and self._worker_thread.is_alive():
             raise RuntimeError("Виконання уже триває.")
