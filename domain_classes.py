@@ -1,246 +1,364 @@
-# ШІ: ООП-архітектура предметної області (Reportable, ValidationRule, Model3D, Project). Змінено: виправлено DegenerateFaceRule (замість NOT_QUAD шукає вироджені грані DEGENERATE_FACE з повтором індексів або нульовою площею) та додано підтримку відносних шляхів при серіалізації в JSON.
-import abc
 import json
 import os
-import logging
-from pathlib import Path
 import xml.etree.ElementTree as ET
-
-import obj_parser
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 import math_logic
 
-logging.basicConfig(
-    filename="mesh_analyzer.log",
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    encoding="utf-8"
-)
 
-
-class Reportable(abc.ABC):
-    @abc.abstractmethod
+class Reportable(ABC):
+    @abstractmethod
     def to_xml(self, save_path: str) -> None:
-        pass
+        raise NotImplementedError
 
 
+@dataclass
 class Vertex:
-    def __init__(self, index: int, x: float, y: float, z: float):
-        self.index = index
-        self.x = x
-        self.y = y
-        self.z = z
+    index: int
+    x: float
+    y: float
+    z: float
 
-    def as_tuple(self) -> tuple:
+    def as_tuple(self) -> tuple[float, float, float]:
         return (self.x, self.y, self.z)
 
 
+@dataclass
 class Face:
-    def __init__(self, index: int, vertex_indices: list):
-        self.index = index
-        self.vertex_indices = vertex_indices
+    index: int
+    vertex_indices: tuple[int, ...]
 
 
+@dataclass
 class Issue:
-    # ШІ: Мапа рівнів критичності помилок. Змінено: додано DEGENERATE_FACE з рівнем Critical замість NOT_QUAD.
-    SEVERITY_MAP = {
-        "ZERO_NORMAL": "Critical",
-        "FLIPPED_NORMAL": "Critical",
-        "DEGENERATE_FACE": "Critical",
-        "DUPLICATE_VERTEX": "Warning"
-    }
-
-    def __init__(self, element_index: int, error_type: str, rule_name: str = ""):
-        self.index = element_index
-        self.error_type = error_type
-        self.rule_name = rule_name or error_type
-        self.severity = self.SEVERITY_MAP.get(error_type, "Warning")
+    index: int
+    error_type: str
+    rule_name: str
+    severity: str
+    description: str = ""
 
     def to_dict(self) -> dict:
         return {
             "index": self.index,
             "error_type": self.error_type,
             "rule_name": self.rule_name,
-            "severity": self.severity
+            "severity": self.severity,
+            "description": self.description,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "Issue":
+        return cls(
+            index=int(data["index"]),
+            error_type=str(data["error_type"]),
+            rule_name=str(data["rule_name"]),
+            severity=str(data["severity"]),
+            description=str(data.get("description", "")),
+        )
 
-class ValidationRule(abc.ABC):
-    def __init__(self, name: str, tolerance: float = 1e-6):
-        if tolerance is None or tolerance <= 0:
-            raise ValueError("Допуск (tolerance) має бути додатним числом (> 0)!")
+
+class ValidationRule(ABC):
+    def __init__(self, name: str, tolerance: float = 1e-6, enabled: bool = True):
         self.name = name
-        self.tolerance = float(tolerance)
+        self.enabled = bool(enabled)
+        self._tolerance = 1e-6
+        self.tolerance = tolerance
 
-    @abc.abstractmethod
+    @property
+    def tolerance(self) -> float:
+        return self._tolerance
+
+    @tolerance.setter
+    def tolerance(self, value: float) -> None:
+        val = float(value)
+        if val <= 0:
+            raise ValueError(f"Допуск правила «{self.name}» має бути > 0 (отримано {val}).")
+        self._tolerance = val
+
+    @abstractmethod
     def check(self, model: "Model3D") -> list[Issue]:
-        pass
+        raise NotImplementedError
+
+    def to_dict(self) -> dict:
+        return {
+            "type": self.__class__.__name__,
+            "name": self.name,
+            "tolerance": self.tolerance,
+            "enabled": self.enabled,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ValidationRule":
+        r_type = data.get("type", "")
+        tol = float(data.get("tolerance", 1e-6))
+        enabled = bool(data.get("enabled", True))
+        mapping = {
+            "DuplicateVertexRule": DuplicateVertexRule,
+            "DegenerateFaceRule": DegenerateFaceRule,
+            "NormalRule": NormalRule,
+        }
+        target_cls = mapping.get(r_type)
+        if target_cls is None:
+            raise ValueError(f"Невідомий тип правила: {r_type}")
+        return target_cls(tolerance=tol, enabled=enabled)
 
 
 class DuplicateVertexRule(ValidationRule):
-    def __init__(self, tolerance: float = 1e-6):
-        super().__init__("DuplicateVertexRule", tolerance)
+    def __init__(self, tolerance: float = 1e-6, enabled: bool = True):
+        super().__init__(name="Дублікати вершин", tolerance=tolerance, enabled=enabled)
 
     def check(self, model: "Model3D") -> list[Issue]:
-        dup_indices = math_logic.find_duplicate_vertices(model.raw_data['vertices'], self.tolerance)
-        return [Issue(idx, "DUPLICATE_VERTEX", self.name) for idx in dup_indices]
+        if not self.enabled:
+            return []
+        verts = model.get_raw_vertices()
+        dups = math_logic.find_duplicate_vertices(verts, tolerance=self.tolerance)
+        return [
+            Issue(
+                index=idx,
+                error_type="DUPLICATE_VERTEX",
+                rule_name=self.name,
+                severity="Warning",
+                description=f"Дублікат вершини #{idx} (допуск {self.tolerance:g})",
+            )
+            for idx in dups
+        ]
 
 
-# ШІ: Правило перевірки виродженості граней. Змінено: видалено помилкову перевірку N-гонів (> 4 вершин), підключено math_logic.is_degenerate_face для виявлення повтору вершин та колінеарності.
 class DegenerateFaceRule(ValidationRule):
-    def __init__(self, tolerance: float = 1e-6):
-        super().__init__("DegenerateFaceRule", tolerance)
+    def __init__(self, tolerance: float = 1e-12, enabled: bool = True):
+        super().__init__(name="Вироджені та n-гони", tolerance=tolerance, enabled=enabled)
 
     def check(self, model: "Model3D") -> list[Issue]:
-        issues = []
-        vertices = model.raw_data['vertices']
-        for face_idx, face_item in enumerate(model.raw_data['faces']):
-            v_indices = [
-                int(item[0]) if isinstance(item, (tuple, list)) else int(item)
-                for item in face_item
-            ]
-            is_deg, _reason = math_logic.is_degenerate_face(v_indices, vertices, self.tolerance)
-            if is_deg:
-                issues.append(Issue(face_idx, "DEGENERATE_FACE", self.name))
+        if not self.enabled:
+            return []
+        verts = model.get_raw_vertices()
+        faces = model.get_raw_faces()
+        zeros, non_quads = math_logic.find_degenerate_and_non_quad_faces(
+            verts, faces, zero_tolerance=self.tolerance
+        )
+        issues = [
+            Issue(
+                index=idx,
+                error_type="ZERO_NORMAL",
+                rule_name=self.name,
+                severity="Critical",
+                description=f"Вироджена грань #{idx} (допуск {self.tolerance:g})",
+            )
+            for idx in zeros
+        ]
+        issues.extend(
+            Issue(
+                index=idx,
+                error_type="NOT_QUAD",
+                rule_name=self.name,
+                severity="Info",
+                description=f"Нечотирикутний полігон #{idx} ({len(faces[idx])} вершин)",
+            )
+            for idx in non_quads
+        )
         return issues
 
 
 class NormalRule(ValidationRule):
-    def __init__(self, tolerance: float = 1e-6):
-        super().__init__("NormalRule", tolerance)
+    def __init__(self, tolerance: float = 1e-12, enabled: bool = True):
+        super().__init__(name="Орієнтація нормалей", tolerance=tolerance, enabled=enabled)
 
     def check(self, model: "Model3D") -> list[Issue]:
-        issues = []
-        center = model.center
-        faces_normals = []
-        face_neighbors = {i: set() for i in range(len(model.raw_data['faces']))}
-        edge_to_faces = {}
-
-        for face_idx, face_item in enumerate(model.raw_data['faces']):
-            coords = obj_parser.get_face_vertices(model.raw_data, face_item)
-            normal = math_logic.calculate_face_normal(coords)
-            faces_normals.append(normal)
-
-            if len(coords) >= 3:
-                errors = math_logic.check_face(coords, center, self.tolerance)
-                for err in errors:
-                    if err == "ZERO_NORMAL":
-                        issues.append(Issue(face_idx, err, self.name))
-
-            v_indices = [
-                int(item[0]) if isinstance(item, (tuple, list)) else int(item)
-                for item in face_item
-            ]
-            for i in range(len(v_indices)):
-                p1, p2 = v_indices[i], v_indices[(i + 1) % len(v_indices)]
-                edge_key = tuple(sorted((p1, p2)))
-                edge_to_faces.setdefault(edge_key, []).append(face_idx)
-
-        for f_list in edge_to_faces.values():
-            if len(f_list) == 2:
-                face_neighbors[f_list[0]].add(f_list[1])
-                face_neighbors[f_list[1]].add(f_list[0])
-
-        flipped = math_logic.check_flipped_normals_by_neighbors(faces_normals, face_neighbors)
-        for f_idx in flipped:
-            issues.append(Issue(f_idx, "FLIPPED_NORMAL", self.name))
-
-        return issues
-
-
-RULE_REGISTRY = {
-    "DuplicateVertexRule": DuplicateVertexRule,
-    "DegenerateFaceRule": DegenerateFaceRule,
-    "NormalRule": NormalRule
-}
-
-
-def run_rule_worker(rule: ValidationRule, model: "Model3D") -> list[Issue]:
-    return rule.check(model)
+        if not self.enabled:
+            return []
+        verts = model.get_raw_vertices()
+        faces = model.get_raw_faces()
+        flipped = math_logic.find_flipped_normals_bfs(verts, faces, zero_tolerance=self.tolerance)
+        return [
+            Issue(
+                index=idx,
+                error_type="FLIPPED_NORMAL",
+                rule_name=self.name,
+                severity="Critical",
+                description=f"Інвертована нормаль грані #{idx} (допуск {self.tolerance:g})",
+            )
+            for idx in flipped
+        ]
 
 
 class Model3D(Reportable):
-    def __init__(self, name: str, file_path: str, raw_data: dict | None = None):
+    def __init__(
+        self,
+        name: str,
+        file_path: str,
+        raw_data: dict | None = None,
+        analyzed: bool = False,
+        vertex_count: int = 0,
+        face_count: int = 0,
+        issues: list[Issue] | None = None,
+    ):
         if not name or not name.strip():
-            raise ValueError("Назва моделі не може бути порожньою!")
-        if not file_path or not os.path.exists(file_path):
-            raise FileNotFoundError(f"Файл моделі не знайдено: {file_path}")
-        if not file_path.lower().endswith(".obj"):
-            raise ValueError("Підтримуються лише файли у форматі .obj!")
-
+            raise ValueError("Назва 3D-моделі не може бути порожньою.")
         self.name = name.strip()
         self.file_path = file_path
-        self.raw_data = raw_data if raw_data is not None else obj_parser.parse_obj(file_path)
-        self.center = obj_parser.calculate_object_center(self.raw_data['vertices'])
-        self.vertices = [Vertex(i, *v) for i, v in enumerate(self.raw_data['vertices'])]
-        self.faces = [Face(i, f) for i, f in enumerate(self.raw_data['faces'])]
-        self.issues: list[Issue] = []
+        self.vertices: list[Vertex] = []
+        self.faces: list[Face] = []
+        self.issues: list[Issue] = issues if issues is not None else []
+        self.analyzed = analyzed
+        self._cached_vertex_count = vertex_count
+        self._cached_face_count = face_count
+
+        if raw_data is not None:
+            self.load_geometry(raw_data)
+
+    def load_geometry(self, raw_data: dict) -> None:
+        raw_verts = raw_data.get("vertices", [])
+        raw_faces = raw_data.get("faces", [])
+        self.vertices = [Vertex(i, v[0], v[1], v[2]) for i, v in enumerate(raw_verts)]
+        self.faces = [Face(i, tuple(f)) for i, f in enumerate(raw_faces)]
+        self._cached_vertex_count = len(self.vertices)
+        self._cached_face_count = len(self.faces)
+
+    @property
+    def vertex_count(self) -> int:
+        return len(self.vertices) if self.vertices else self._cached_vertex_count
+
+    @property
+    def face_count(self) -> int:
+        return len(self.faces) if self.faces else self._cached_face_count
+
+    def get_raw_vertices(self) -> list[tuple[float, float, float]]:
+        return [v.as_tuple() for v in self.vertices]
+
+    def get_raw_faces(self) -> list[tuple[int, ...]]:
+        return [f.vertex_indices for f in self.faces]
 
     def validate(self, rules: list[ValidationRule]) -> list[Issue]:
-        self.issues.clear()
-        seen = set()
+        all_issues: list[Issue] = []
         for rule in rules:
-            found = rule.check(self)
-            for iss in found:
-                key = (iss.index, iss.error_type)
-                if key not in seen:
-                    seen.add(key)
-                    self.issues.append(iss)
-        logging.info(f"Перевірка '{self.name}' завершена: знайдено {len(self.issues)} помилок")
+            if rule.enabled:
+                all_issues.extend(rule.check(self))
+        self.set_issues_deduplicated(all_issues)
+        self.analyzed = True
         return self.issues
 
-    def set_issues_deduplicated(self, raw_issues: list[Issue]) -> list[Issue]:
-        self.issues.clear()
-        seen = set()
-        for iss in raw_issues:
-            key = (iss.index, iss.error_type)
+    def set_issues_deduplicated(self, issues: list[Issue]) -> None:
+        seen: set[tuple[str, int]] = set()
+        unique: list[Issue] = []
+        for iss in issues:
+            key = (iss.error_type, iss.index)
             if key not in seen:
                 seen.add(key)
-                self.issues.append(iss)
-        logging.info(f"Перевірка '{self.name}' завершена: знайдено {len(self.issues)} помилок")
-        return self.issues
+                unique.append(iss)
+        unique.sort(key=lambda x: (x.severity != "Critical", x.severity != "Warning", x.index))
+        self.issues = unique
+        self.analyzed = True
 
     def to_xml(self, save_path: str) -> None:
-        root_elem = ET.Element("ValidationReport")
-        root_elem.set("model_name", self.name)
-        root_elem.set("source_file", self.file_path)
-        root_elem.set("total_vertices", str(len(self.vertices)))
-        root_elem.set("total_faces", str(len(self.faces)))
-        root_elem.set("total_errors", str(len(self.issues)))
-
-        for issue in self.issues:
-            err_elem = ET.SubElement(root_elem, "Issue")
-            ET.SubElement(err_elem, "Model").text = self.name
-            ET.SubElement(err_elem, "Rule").text = issue.rule_name
-            ET.SubElement(err_elem, "ElementIndex").text = str(issue.index)
-            ET.SubElement(err_elem, "ErrorType").text = issue.error_type
-            ET.SubElement(err_elem, "Severity").text = issue.severity
-
-        tree = ET.ElementTree(root_elem)
+        root = ET.Element(
+            "ModelReport",
+            attrib={
+                "name": self.name,
+                "file_path": self.file_path,
+                "vertices": str(self.vertex_count),
+                "faces": str(self.face_count),
+                "issues_count": str(len(self.issues)),
+            },
+        )
+        issues_el = ET.SubElement(root, "Issues")
+        for iss in self.issues:
+            ET.SubElement(
+                issues_el,
+                "Issue",
+                attrib={
+                    "index": str(iss.index),
+                    "type": iss.error_type,
+                    "rule": iss.rule_name,
+                    "severity": iss.severity,
+                    "description": iss.description,
+                },
+            )
+        tree = ET.ElementTree(root)
         ET.indent(tree, space="  ")
         tree.write(save_path, encoding="utf-8", xml_declaration=True)
-        logging.info(f"XML-звіт збережено: {save_path}")
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "file_path": self.file_path,
+            "analyzed": self.analyzed,
+            "vertex_count": self.vertex_count,
+            "face_count": self.face_count,
+            "issues": [i.to_dict() for i in self.issues],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Model3D":
+        return cls(
+            name=data["name"],
+            file_path=data["file_path"],
+            analyzed=bool(data.get("analyzed", False)),
+            vertex_count=int(data.get("vertex_count", 0)),
+            face_count=int(data.get("face_count", 0)),
+            issues=[Issue.from_dict(x) for x in data.get("issues", [])],
+        )
 
 
 class Project:
-    def __init__(self, name: str):
+    def __init__(
+        self,
+        name: str = "Проєкт за замовчуванням",
+        models: list[Model3D] | None = None,
+        rules: list[ValidationRule] | None = None,
+    ):
         if not name or not name.strip():
-            raise ValueError("Назва проєкту не може бути порожньою!")
+            raise ValueError("Назва проєкту не може бути порожньою.")
         self.name = name.strip()
-        self.models: list[Model3D] = []
-        self.rules: list[ValidationRule] = [
-            DuplicateVertexRule(1e-6),
-            DegenerateFaceRule(1e-6),
-            NormalRule(1e-6)
-        ]
+        self.models: list[Model3D] = models if models is not None else []
+        self.rules: list[ValidationRule] = (
+            rules
+            if rules is not None
+            else [
+                DuplicateVertexRule(tolerance=1e-6, enabled=True),
+                DegenerateFaceRule(tolerance=1e-12, enabled=True),
+                NormalRule(tolerance=1e-12, enabled=True),
+            ]
+        )
 
-    def rename(self, new_name: str):
-        if not new_name or not new_name.strip():
-            raise ValueError("Нова назва проєкту не може бути порожньою!")
-        self.name = new_name.strip()
-
-    def add_model(self, model: Model3D):
-        self.remove_model(model.name)
+    def add_model(self, model: Model3D) -> None:
+        for i, existing in enumerate(self.models):
+            if existing.name.lower() == model.name.lower():
+                self.models[i] = model
+                return
         self.models.append(model)
+
+    def update_model(self, old_name: str, new_name: str, new_path: str) -> Model3D:
+        if not new_name or not new_name.strip():
+            raise ValueError("Нова назва моделі не може бути порожньою.")
+        if not new_path or not os.path.isfile(new_path):
+            raise FileNotFoundError(f"Файл моделі не існує: {new_path}")
+
+        target = self.get_model(old_name)
+        if target is None:
+            raise KeyError(f"Модель «{old_name}» не знайдено у проєкті.")
+
+        clean_new = new_name.strip()
+        if clean_new.lower() != old_name.lower() and self.get_model(clean_new) is not None:
+            raise ValueError(f"Модель із назвою «{clean_new}» вже існує у проєкті.")
+
+        path_changed = os.path.abspath(target.file_path) != os.path.abspath(new_path)
+        target.name = clean_new
+        target.file_path = new_path
+        if path_changed:
+            target.vertices.clear()
+            target.faces.clear()
+            target.issues.clear()
+            target.analyzed = False
+            target._cached_vertex_count = 0
+            target._cached_face_count = 0
+        return target
+
+    def remove_model(self, model_name: str) -> bool:
+        for i, m in enumerate(self.models):
+            if m.name == model_name:
+                self.models.pop(i)
+                return True
+        return False
 
     def get_model(self, model_name: str) -> Model3D | None:
         for m in self.models:
@@ -248,87 +366,127 @@ class Project:
                 return m
         return None
 
-    def remove_model(self, model_name: str):
-        self.models = [m for m in self.models if m.name != model_name]
-
     def find_models(self, query: str) -> list[Model3D]:
-        q = query.lower().strip()
+        q = query.strip().lower()
         if not q:
             return list(self.models)
         return [m for m in self.models if q in m.name.lower()]
 
-    def sort_models(self, by: str = "errors", reverse: bool = True) -> list[Model3D]:
+    def sort_models(self, by: str = "name", reverse: bool = False) -> list[Model3D]:
         if by == "vertices":
-            return sorted(self.models, key=lambda m: len(m.vertices), reverse=reverse)
-        if by == "name":
-            return sorted(self.models, key=lambda m: m.name.lower(), reverse=reverse)
-        return sorted(self.models, key=lambda m: len(m.issues), reverse=reverse)
+            return sorted(self.models, key=lambda m: m.vertex_count, reverse=reverse)
+        if by == "issues":
+            return sorted(self.models, key=lambda m: len(m.issues), reverse=reverse)
+        return sorted(self.models, key=lambda m: m.name.lower(), reverse=reverse)
 
-    def add_or_update_rule(self, rule_type: str, tolerance: float):
-        if tolerance <= 0:
-            raise ValueError("Допуск має бути додатним числом (> 0)!")
-        if rule_type not in RULE_REGISTRY:
-            raise ValueError(f"Невідомий тип правила: {rule_type}")
-        self.remove_rule(rule_type)
-        self.rules.append(RULE_REGISTRY[rule_type](tolerance))
-
-    def remove_rule(self, rule_type: str):
-        self.rules = [r for r in self.rules if r.name != rule_type]
-
-    # ШІ: Збереження конфігурації проєкту у JSON. Змінено: реалізовано конвертацію шляхів до моделей у відносний формат (POSIX) для переносимості репозиторію.
-    def save_to_json(self, json_path: str = "projects.json"):
-        base_dir = Path(json_path).resolve().parent
-        models_payload = []
-        for m in self.models:
-            try:
-                rel_path = os.path.relpath(Path(m.file_path).resolve(), base_dir).replace("\\", "/")
-            except ValueError:
-                rel_path = m.file_path.replace("\\", "/")
-            models_payload.append({
-                "name": m.name,
-                "path": rel_path,
-                "vertices_count": len(m.vertices),
-                "errors_count": len(m.issues)
-            })
-
-        payload = {
-            "project_name": self.name,
-            "rules": [{"type": r.name, "tolerance": r.tolerance} for r in self.rules],
-            "models": models_payload
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "rules": [r.to_dict() for r in self.rules],
+            "models": [m.to_dict() for m in self.models],
         }
-        with open(json_path, "w", encoding="utf-8") as f:
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Project":
+        rules = [ValidationRule.from_dict(r) for r in data.get("rules", [])]
+        models = [Model3D.from_dict(m) for m in data.get("models", [])]
+        return cls(name=data.get("name", "Без назви"), models=models, rules=rules if rules else None)
+
+
+class ProjectStorage:
+    """Менеджер зберігання та завантаження кількох проєктів у JSON-файлі."""
+
+    def __init__(self, storage_path: str = "projects.json"):
+        self.storage_path = storage_path
+        self.projects: dict[str, Project] = {}
+        self.active_project_name: str = ""
+
+    def load_all(self) -> Project:
+        if not os.path.isfile(self.storage_path):
+            default_proj = Project("Проєкт за замовчуванням")
+            self.projects = {default_proj.name: default_proj}
+            self.active_project_name = default_proj.name
+            self.save_all()
+            return default_proj
+
+        with open(self.storage_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        # Підтримка зворотної сумісності зі старим однопроєктним JSON
+        if "projects" not in raw and "name" in raw:
+            proj = Project.from_dict(raw)
+            self.projects = {proj.name: proj}
+            self.active_project_name = proj.name
+            self.save_all()
+            return proj
+
+        self.projects.clear()
+        for p_data in raw.get("projects", []):
+            proj = Project.from_dict(p_data)
+            self.projects[proj.name] = proj
+
+        if not self.projects:
+            default_proj = Project("Проєкт за замовчуванням")
+            self.projects[default_proj.name] = default_proj
+
+        active_name = raw.get("active_project", "")
+        if active_name in self.projects:
+            self.active_project_name = active_name
+        else:
+            self.active_project_name = next(iter(self.projects))
+
+        return self.projects[self.active_project_name]
+
+    def save_all(self) -> None:
+        payload = {
+            "active_project": self.active_project_name,
+            "projects": [p.to_dict() for p in self.projects.values()],
+        }
+        with open(self.storage_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    # ШІ: Завантаження проєкту з JSON. Змінено: відновлення відносних шляхів моделей відносно директорії JSON-файлу.
-    @staticmethod
-    def load_from_json(json_path: str = "projects.json") -> "Project":
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except json.JSONDecodeError as e:
-            logging.error(f"Некоректний JSON у файлі {json_path}: {e}")
-            raise ValueError(f"Пошкоджений JSON-файл '{json_path}': {e}") from e
+    def get_active(self) -> Project:
+        return self.projects[self.active_project_name]
 
-        base_dir = Path(json_path).resolve().parent
-        proj = Project(data.get("project_name", "Default Project"))
-        if "rules" in data and isinstance(data["rules"], list):
-            proj.rules.clear()
-            for r_info in data["rules"]:
-                r_type = r_info.get("type")
-                tol = float(r_info.get("tolerance", 1e-6))
-                if r_type in RULE_REGISTRY and tol > 0:
-                    proj.rules.append(RULE_REGISTRY[r_type](tol))
+    def set_active(self, name: str) -> Project:
+        if name not in self.projects:
+            raise KeyError(f"Проєкт «{name}» не знайдено.")
+        self.active_project_name = name
+        self.save_all()
+        return self.projects[name]
 
-        for m_info in data.get("models", []):
-            raw_path = m_info.get("path", "")
-            m_name = m_info.get("name", os.path.basename(raw_path))
-            if not raw_path:
-                continue
-            resolved_path = raw_path if os.path.isabs(raw_path) else str(base_dir / raw_path)
-            if os.path.exists(resolved_path):
-                try:
-                    m_obj = Model3D(m_name, resolved_path)
-                    proj.add_model(m_obj)
-                except Exception as ex:
-                    logging.warning(f"Пропущено модель '{m_name}' при завантаженні JSON: {ex}")
+    def create_or_select_project(self, name: str) -> Project:
+        clean = name.strip()
+        if not clean:
+            raise ValueError("Назва проєкту не може бути порожньою.")
+        if clean not in self.projects:
+            self.projects[clean] = Project(clean)
+        self.active_project_name = clean
+        self.save_all()
+        return self.projects[clean]
+
+    def rename_active_project(self, new_name: str) -> Project:
+        clean = new_name.strip()
+        if not clean:
+            raise ValueError("Назва проєкту не може бути порожньою.")
+        proj = self.get_active()
+        if clean != proj.name:
+            if clean in self.projects:
+                raise ValueError(f"Проєкт із назвою «{clean}» вже існує.")
+            del self.projects[proj.name]
+            proj.name = clean
+            self.projects[clean] = proj
+            self.active_project_name = clean
+        self.save_all()
         return proj
+
+    def delete_project(self, name: str) -> Project:
+        if name in self.projects:
+            del self.projects[name]
+        if not self.projects:
+            fallback = Project("Проєкт за замовчуванням")
+            self.projects[fallback.name] = fallback
+        if self.active_project_name not in self.projects:
+            self.active_project_name = next(iter(self.projects))
+        self.save_all()
+        return self.projects[self.active_project_name]
