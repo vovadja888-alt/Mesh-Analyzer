@@ -84,7 +84,6 @@ class MeshAnalyzerView(ctk.CTk):
         self._sync_project_ui()
         self.after(100, self._poll_queue)
 
-    # ==================== ВЕРХНЯ ПАНЕЛЬ ПРОЄКТІВ (МУЛЬТИПРОЄКТНІСТЬ) ====================
     def _build_top_project_bar(self) -> None:
         bar = ctk.CTkFrame(self)
         bar.pack(fill="x", padx=10, pady=(10, 5))
@@ -108,7 +107,6 @@ class MeshAnalyzerView(ctk.CTk):
         ctk.CTkButton(bar, text="Експорт JSON", width=105, command=self._on_export_json).pack(side="right", padx=(4, 10))
         ctk.CTkButton(bar, text="Імпорт JSON", width=105, command=self._on_import_json).pack(side="right", padx=4)
 
-    # ==================== ОСНОВНИЙ МАКЕТ ====================
     def _build_main_layout(self) -> None:
         container = ctk.CTkFrame(self, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=10, pady=5)
@@ -301,7 +299,6 @@ class MeshAnalyzerView(ctk.CTk):
         )
         ctk.CTkLabel(parent, text=legend, text_color="#B0B0B0").pack(anchor="w", padx=10, pady=(2, 8))
 
-    # ==================== СИНХРОНІЗАЦІЯ UI ====================
     def _sync_project_ui(self) -> None:
         names = self.ctrl.get_project_names()
         self.combo_projects.configure(values=names)
@@ -358,7 +355,6 @@ class MeshAnalyzerView(ctk.CTk):
                 "", "end", iid=str(i), values=(f"#{iss.index}", iss.error_type, iss.severity, iss.description)
             )
 
-    # ==================== ОБРОБНИКИ ПОДІЙ ====================
     def _on_switch_project(self, selected_name: str) -> None:
         self.ctrl.switch_project(selected_name)
         self._sync_project_ui()
@@ -582,7 +578,6 @@ class MeshAnalyzerView(ctk.CTk):
             pass
         self.after(100, self._poll_queue)
 
-    # ==================== 2D-ВІЗУАЛІЗАЦІЯ ПРОЄКЦІЙ ====================
     def _reset_view(self) -> None:
         self.zoom_scale = 1.0
         self.pan_x = 0.0
