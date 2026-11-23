@@ -1,652 +1,673 @@
 # ШІ: Графічний інтерфейс користувача на базі CustomTkinter. Змінено: оновлено підпис чекбокса правила перевірки виродженості граней.
+import os
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-import queue
+from tkinter import filedialog, messagebox, simpledialog, ttk
 import customtkinter as ctk
+from controller import MeshAnalyzerController
 
-import controller
 
-ctk.set_appearance_mode("dark")
+class ModelEditDialog(ctk.CTkToplevel):
+    """Модальне вікно для додавання або редагування 3D-моделі у проєкті без запуску аналізу."""
+
+    def __init__(self, parent, title: str, initial_name: str = "", initial_path: str = ""):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("520x210")
+        self.resizable(False, False)
+        self.grab_set()
+        self.result: tuple[str, str] | None = None
+
+        ctk.CTkLabel(self, text="Назва моделі у проєкті:").pack(anchor="w", padx=16, pady=(14, 2))
+        self.entry_name = ctk.CTkEntry(self, width=480)
+        self.entry_name.insert(0, initial_name)
+        self.entry_name.pack(padx=16)
+
+        ctk.CTkLabel(self, text="Шлях до файлу (.obj):").pack(anchor="w", padx=16, pady=(10, 2))
+        path_row = ctk.CTkFrame(self, fg_color="transparent")
+        path_row.pack(fill="x", padx=16)
+        self.entry_path = ctk.CTkEntry(path_row, width=385)
+        self.entry_path.insert(0, initial_path)
+        self.entry_path.pack(side="left")
+        ctk.CTkButton(path_row, text="Огляд...", width=85, command=self._browse).pack(side="right")
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(18, 10))
+        ctk.CTkButton(btn_row, text="Зберегти", width=120, command=self._on_save).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btn_row, text="Скасувати", width=110, fg_color="#555555", command=self.destroy).pack(side="right")
+
+    def _browse(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("Wavefront OBJ", "*.obj")])
+        if path:
+            self.entry_path.delete(0, "end")
+            self.entry_path.insert(0, path)
+            if not self.entry_name.get().strip():
+                self.entry_name.insert(0, os.path.basename(path))
+
+    def _on_save(self) -> None:
+        name = self.entry_name.get().strip()
+        path = self.entry_path.get().strip()
+        if not name:
+            messagebox.showwarning("Валідація", "Введіть назву моделі.", parent=self)
+            return
+        if not path or not os.path.isfile(path):
+            messagebox.showwarning("Валідація", "Оберіть існуючий файл .obj.", parent=self)
+            return
+        self.result = (name, path)
+        self.destroy()
 
 
 class MeshAnalyzerView(ctk.CTk):
-    def __init__(self, ctrl: controller.MeshAnalyzerController):
+    def __init__(self, controller: MeshAnalyzerController):
         super().__init__()
-        self.ctrl = ctrl
+        self.ctrl = controller
+        self.title("MeshAnalyzer - Аналіз та валідація топології 3D-моделей")
+        self.geometry("1340x820")
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
 
-        self.title("Meshanalyzer — Аналіз та валідація 3D-моделей")
-        self.geometry("1380x800")
-        self.minsize(1200, 720)
-        self.configure(fg_color="#0d0d0d")
+        if os.path.isfile("Icon.ico"):
+            try:
+                self.iconbitmap("Icon.ico")
+            except Exception:
+                pass
 
-        self.canvas_states = {}
-        self.active_rule_filter = "Усі"
-        self.active_severity_filter = "Усі"
+        self.zoom_scale = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._drag_start = (0, 0)
+        self.highlighted_issue: tuple[str, int] | None = None
+        self.sort_col = "name"
+        self.sort_reverse = False
 
-        self._configure_treeview_style()
-        self._build_layout()
-        self._refresh_models_table()
-        self._sync_rules_ui_from_project()
+        self._build_top_project_bar()
+        self._build_main_layout()
+        self._sync_project_ui()
+        self.after(100, self._poll_queue)
 
-    def _configure_treeview_style(self):
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure(
-            "Dark.Treeview",
-            background="#141414",
-            foreground="#e6e6e6",
-            fieldbackground="#141414",
-            borderwidth=0,
-            font=("Segoe UI", 10),
-            rowheight=24
+    # ==================== ВЕРХНЯ ПАНЕЛЬ ПРОЄКТІВ (МУЛЬТИПРОЄКТНІСТЬ) ====================
+    def _build_top_project_bar(self) -> None:
+        bar = ctk.CTkFrame(self)
+        bar.pack(fill="x", padx=10, pady=(10, 5))
+
+        ctk.CTkLabel(bar, text="Активний проєкт:").pack(side="left", padx=(10, 6))
+        self.combo_projects = ctk.CTkComboBox(
+            bar, width=210, values=self.ctrl.get_project_names(), command=self._on_switch_project
         )
-        style.configure(
-            "Dark.Treeview.Heading",
-            background="#222222",
-            foreground="#ffffff",
-            font=("Segoe UI", 10, "bold"),
-            relief="flat"
+        self.combo_projects.pack(side="left", padx=4)
+
+        self.entry_proj_name = ctk.CTkEntry(bar, width=190, placeholder_text="Назва проєкту...")
+        self.entry_proj_name.pack(side="left", padx=6)
+
+        ctk.CTkButton(bar, text="Новий", width=75, command=self._on_new_project).pack(side="left", padx=3)
+        ctk.CTkButton(bar, text="Перейменувати", width=115, command=self._on_rename_project).pack(side="left", padx=3)
+        ctk.CTkButton(
+            bar, text="Видалити проєкт", width=120, fg_color="#8B2635", hover_color="#6E1D29",
+            command=self._on_delete_project
+        ).pack(side="left", padx=3)
+
+        ctk.CTkButton(bar, text="Експорт JSON", width=105, command=self._on_export_json).pack(side="right", padx=(4, 10))
+        ctk.CTkButton(bar, text="Імпорт JSON", width=105, command=self._on_import_json).pack(side="right", padx=4)
+
+    # ==================== ОСНОВНИЙ МАКЕТ ====================
+    def _build_main_layout(self) -> None:
+        container = ctk.CTkFrame(self, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=10, pady=5)
+
+        left_panel = ctk.CTkFrame(container, width=540)
+        left_panel.pack(side="left", fill="both", expand=False, padx=(0, 8))
+        left_panel.pack_propagate(False)
+
+        right_panel = ctk.CTkFrame(container)
+        right_panel.pack(side="right", fill="both", expand=True)
+
+        self._build_rules_panel(left_panel)
+        self._build_analysis_controls(left_panel)
+        self._build_models_table(left_panel)
+        self._build_issues_table(left_panel)
+        self._build_canvas_panel(right_panel)
+
+    def _build_rules_panel(self, parent) -> None:
+        box = ctk.CTkFrame(parent)
+        box.pack(fill="x", padx=8, pady=(8, 4))
+
+        ctk.CTkLabel(box, text="Правила валідації та індивідуальні допуски (tolerance > 0):", font=("", 13, "bold")).pack(
+            anchor="w", padx=8, pady=(6, 4)
         )
-        style.map("Dark.Treeview", background=[("selected", "#b8252f")], foreground=[("selected", "#ffffff")])
 
-    def _build_layout(self):
-        self.grid_columnconfigure(0, weight=5)
-        self.grid_columnconfigure(1, weight=6)
-        self.grid_rowconfigure(0, weight=1)
+        # 1. DuplicateVertexRule
+        r1 = ctk.CTkFrame(box, fg_color="transparent")
+        r1.pack(fill="x", padx=8, pady=2)
+        self.var_dup = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(r1, text="Дублікати вершин", variable=self.var_dup, width=180).pack(side="left")
+        ctk.CTkLabel(r1, text="Допуск:").pack(side="left", padx=(8, 4))
+        self.entry_tol_dup = ctk.CTkEntry(r1, width=95)
+        self.entry_tol_dup.pack(side="left")
 
-        left_panel = ctk.CTkFrame(self, fg_color="#141414", border_width=1, border_color="#2a2a2a", corner_radius=8)
-        left_panel.grid(row=0, column=0, sticky="nsew", padx=(12, 6), pady=12)
-        left_panel.grid_columnconfigure(0, weight=1)
-        left_panel.grid_rowconfigure(4, weight=1)
-        left_panel.grid_rowconfigure(6, weight=2)
+        # 2. DegenerateFaceRule
+        r2 = ctk.CTkFrame(box, fg_color="transparent")
+        r2.pack(fill="x", padx=8, pady=2)
+        self.var_deg = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(r2, text="Вироджені та n-гони", variable=self.var_deg, width=180).pack(side="left")
+        ctk.CTkLabel(r2, text="Допуск:").pack(side="left", padx=(8, 4))
+        self.entry_tol_deg = ctk.CTkEntry(r2, width=95)
+        self.entry_tol_deg.pack(side="left")
 
-        proj_frame = ctk.CTkFrame(left_panel, fg_color="#1c1c1c", border_width=1, border_color="#2e2e2e", corner_radius=6)
-        proj_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
-        proj_frame.grid_columnconfigure(1, weight=1)
+        # 3. NormalRule
+        r3 = ctk.CTkFrame(box, fg_color="transparent")
+        r3.pack(fill="x", padx=8, pady=2)
+        self.var_norm = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(r3, text="Орієнтація нормалей", variable=self.var_norm, width=180).pack(side="left")
+        ctk.CTkLabel(r3, text="Допуск:").pack(side="left", padx=(8, 4))
+        self.entry_tol_norm = ctk.CTkEntry(r3, width=95)
+        self.entry_tol_norm.pack(side="left")
 
-        ctk.CTkLabel(proj_frame, text="Проєкт:", text_color="#ffffff", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, padx=8, pady=6)
-        self.entry_project = ctk.CTkEntry(proj_frame, fg_color="#121212", border_color="#383838", text_color="#ffffff", placeholder_text="Назва проєкту")
-        self.entry_project.insert(0, self.ctrl.project.name)
-        self.entry_project.grid(row=0, column=1, sticky="ew", padx=4, pady=6)
+        ctk.CTkButton(box, text="Застосувати допуски", height=28, command=self._on_apply_rules).pack(
+            anchor="e", padx=8, pady=(4, 8)
+        )
 
-        ctk.CTkButton(proj_frame, text="Зберегти назву", width=105, fg_color="#2e2e2e", hover_color="#3d3d3d", text_color="#ffffff", command=self._on_rename_project).grid(row=0, column=2, padx=4, pady=6)
-        ctk.CTkButton(proj_frame, text="Новий", width=65, fg_color="#242424", hover_color="#363636", text_color="#dcdcdc", command=self._on_new_project).grid(row=0, column=3, padx=4, pady=6)
-        ctk.CTkButton(proj_frame, text="Імпорт JSON", width=95, fg_color="#1f7a3f", hover_color="#175e30", text_color="#ffffff", command=self._on_import_json).grid(row=0, column=4, padx=(4, 8), pady=6)
+    def _build_analysis_controls(self, parent) -> None:
+        box = ctk.CTkFrame(parent)
+        box.pack(fill="x", padx=8, pady=4)
 
-        file_frame = ctk.CTkFrame(left_panel, fg_color="#1c1c1c", border_width=1, border_color="#2e2e2e", corner_radius=6)
-        file_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=6)
-        file_frame.grid_columnconfigure(0, weight=1)
+        file_row = ctk.CTkFrame(box, fg_color="transparent")
+        file_row.pack(fill="x", padx=8, pady=(8, 4))
+        self.entry_file = ctk.CTkEntry(file_row, placeholder_text="Шлях до .obj файлу...")
+        self.entry_file.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ctk.CTkButton(file_row, text="Огляд...", width=80, command=self._on_browse_file).pack(side="right")
 
-        self.entry_path = ctk.CTkEntry(file_frame, fg_color="#121212", border_color="#383838", text_color="#ffffff", placeholder_text="Шлях до 3D-моделі (.obj)...")
-        self.entry_path.insert(0, "test_models/01_valid_cube.obj")
-        self.entry_path.grid(row=0, column=0, sticky="ew", padx=(8, 6), pady=8)
+        act_row = ctk.CTkFrame(box, fg_color="transparent")
+        act_row.pack(fill="x", padx=8, pady=4)
+        self.btn_run = ctk.CTkButton(act_row, text="Перевірити файл", width=130, command=self._on_run_single)
+        self.btn_run.pack(side="left", padx=(0, 4))
+        self.btn_batch = ctk.CTkButton(
+            act_row, text="Перевірити всі в проєкті", width=165, fg_color="#1F6AA5", command=self._on_run_batch
+        )
+        self.btn_batch.pack(side="left", padx=4)
+        self.btn_cancel = ctk.CTkButton(
+            act_row, text="Скасувати", width=95, fg_color="#9E2A2B", hover_color="#781E1F",
+            command=self._on_cancel_analysis
+        )
+        self.btn_cancel.pack(side="right")
 
-        ctk.CTkButton(file_frame, text="Огляд...", width=85, fg_color="#2e2e2e", hover_color="#3f3f3f", text_color="#ffffff", command=self._on_browse_obj).grid(row=0, column=1, padx=4, pady=8)
-        self.btn_run = ctk.CTkButton(file_frame, text="Перевірити", width=105, fg_color="#1f7a3f", hover_color="#175e30", text_color="#ffffff", font=("Segoe UI", 12, "bold"), command=self._on_run_analysis)
-        self.btn_run.grid(row=0, column=2, padx=4, pady=8)
-        self.btn_cancel = ctk.CTkButton(file_frame, text="Скасувати", width=90, fg_color="#b8252f", hover_color="#8f1b23", text_color="#ffffff", state="disabled", command=self._on_cancel_analysis)
-        self.btn_cancel.grid(row=0, column=3, padx=(4, 8), pady=8)
-
-        prog_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
-        prog_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(2, 6))
-        prog_frame.grid_columnconfigure(0, weight=1)
-
-        self.progress_bar = ctk.CTkProgressBar(prog_frame, height=10, fg_color="#242424", progress_color="#28a745")
+        self.progress_bar = ctk.CTkProgressBar(box)
         self.progress_bar.set(0)
-        self.progress_bar.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.progress_bar.pack(fill="x", padx=8, pady=(4, 2))
 
-        self.lbl_status = ctk.CTkLabel(prog_frame, text="Готово до роботи", font=("Segoe UI", 11), text_color="#9e9e9e")
-        self.lbl_status.grid(row=0, column=1, sticky="e")
+        self.lbl_status = ctk.CTkLabel(box, text="Готово до роботи", text_color="#A0A0A0")
+        self.lbl_status.pack(anchor="w", padx=8, pady=(0, 6))
 
-        rules_frame = ctk.CTkFrame(left_panel, fg_color="#1c1c1c", border_width=1, border_color="#2e2e2e", corner_radius=6)
-        rules_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=6)
+    def _build_models_table(self, parent) -> None:
+        box = ctk.CTkFrame(parent)
+        box.pack(fill="both", expand=True, padx=8, pady=4)
 
-        self.var_dup = ctk.BooleanVar(value=True)
-        self.var_deg = ctk.BooleanVar(value=True)
-        self.var_norm = ctk.BooleanVar(value=True)
+        top = ctk.CTkFrame(box, fg_color="transparent")
+        top.pack(fill="x", padx=6, pady=(6, 4))
+        ctk.CTkLabel(top, text="Моделі проєкту:", font=("", 12, "bold")).pack(side="left")
+        self.entry_search = ctk.CTkEntry(top, width=155, placeholder_text="Пошук моделі...")
+        self.entry_search.pack(side="right")
+        self.entry_search.bind("<KeyRelease>", lambda _e: self._refresh_models_table())
 
-        cb_kwargs = {"fg_color": "#1f7a3f", "hover_color": "#175e30", "border_color": "#555555", "text_color": "#e6e6e6"}
-        ctk.CTkCheckBox(rules_frame, text="Дублікати", variable=self.var_dup, width=90, **cb_kwargs).pack(side="left", padx=(8, 4), pady=6)
-        ctk.CTkCheckBox(rules_frame, text="Вироджені", variable=self.var_deg, width=85, **cb_kwargs).pack(side="left", padx=4, pady=6)
-        ctk.CTkCheckBox(rules_frame, text="Нормалі", variable=self.var_norm, width=80, **cb_kwargs).pack(side="left", padx=4, pady=6)
-
-        ctk.CTkLabel(rules_frame, text="Допуск:", text_color="#cccccc").pack(side="left", padx=(8, 4))
-        self.entry_tol = ctk.CTkEntry(rules_frame, width=75, fg_color="#121212", border_color="#383838", text_color="#ffffff")
-        self.entry_tol.insert(0, "1e-6")
-        self.entry_tol.pack(side="left", padx=4, pady=6)
-
-        ctk.CTkButton(rules_frame, text="Застосувати", width=95, fg_color="#2e2e2e", hover_color="#3f3f3f", text_color="#ffffff", command=self._on_apply_rules).pack(side="right", padx=(4, 8), pady=6)
-
-        models_box = ctk.CTkFrame(left_panel, fg_color="#1c1c1c", border_width=1, border_color="#2e2e2e", corner_radius=6)
-        models_box.grid(row=4, column=0, sticky="nsew", padx=10, pady=6)
-        models_box.grid_columnconfigure(0, weight=1)
-        models_box.grid_rowconfigure(1, weight=1)
-
-        m_toolbar = ctk.CTkFrame(models_box, fg_color="transparent")
-        m_toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
-        m_toolbar.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(m_toolbar, text="Моделі проєкту:", text_color="#ffffff", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, padx=(2, 6))
-        self.entry_search = ctk.CTkEntry(m_toolbar, fg_color="#121212", border_color="#383838", text_color="#ffffff", placeholder_text="Пошук за назвою...", height=28)
-        self.entry_search.grid(row=0, column=1, sticky="ew", padx=4)
-        self.entry_search.bind("<KeyRelease>", lambda e: self._refresh_models_table())
-
-        self.combo_sort = ctk.CTkComboBox(
-            m_toolbar,
-            values=["Сортувати: Помилки", "Сортувати: Вершини", "Сортувати: Назва"],
-            width=165,
-            height=28,
-            fg_color="#121212",
-            border_color="#383838",
-            button_color="#2e2e2e",
-            button_hover_color="#3f3f3f",
-            text_color="#ffffff",
-            command=lambda _: self._refresh_models_table()
+        crud_row = ctk.CTkFrame(box, fg_color="transparent")
+        crud_row.pack(fill="x", padx=6, pady=(0, 4))
+        ctk.CTkButton(crud_row, text="+ Додати", width=85, height=26, command=self._on_add_model_crud).pack(
+            side="left", padx=(0, 4)
         )
-        self.combo_sort.grid(row=0, column=2, padx=4)
-
-        ctk.CTkButton(m_toolbar, text="Видалити", width=75, height=28, fg_color="#b8252f", hover_color="#8f1b23", text_color="#ffffff", command=self._on_delete_selected_model).grid(row=0, column=3, padx=(4, 2))
-
-        self.tree_models = ttk.Treeview(
-            models_box,
-            columns=("name", "vertices", "errors"),
-            show="headings",
-            style="Dark.Treeview",
-            height=4
+        ctk.CTkButton(crud_row, text="Редагувати", width=95, height=26, command=self._on_edit_model_crud).pack(
+            side="left", padx=4
         )
-        self.tree_models.heading("name", text="Назва моделі")
-        self.tree_models.heading("vertices", text="Вершин")
-        self.tree_models.heading("errors", text="Помилок")
-        self.tree_models.column("name", width=260, anchor="w")
-        self.tree_models.column("vertices", width=95, anchor="center")
-        self.tree_models.column("errors", width=95, anchor="center")
-        self.tree_models.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
-        self.tree_models.bind("<<TreeviewSelect>>", self._on_select_model_row)
+        ctk.CTkButton(
+            crud_row, text="Видалити", width=85, height=26, fg_color="#7A2021", command=self._on_delete_model_crud
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            crud_row, text="Перевірити обрану", width=130, height=26, command=self._on_analyze_selected_model
+        ).pack(side="right")
 
-        filter_bar = ctk.CTkFrame(left_panel, fg_color="#1c1c1c", border_width=1, border_color="#2e2e2e", corner_radius=6)
-        filter_bar.grid(row=5, column=0, sticky="ew", padx=10, pady=6)
+        cols = ("name", "verts", "issues", "status")
+        self.tree_models = ttk.Treeview(box, columns=cols, show="headings", height=6)
+        self.tree_models.heading("name", text="Назва моделі", command=lambda: self._sort_models_by("name"))
+        self.tree_models.heading("verts", text="Вершин", command=lambda: self._sort_models_by("vertices"))
+        self.tree_models.heading("issues", text="Помилок", command=lambda: self._sort_models_by("issues"))
+        self.tree_models.heading("status", text="Статус")
 
-        ctk.CTkLabel(filter_bar, text="Правило:", text_color="#cccccc").pack(side="left", padx=(8, 4), pady=6)
-        self.combo_rule_filter = ctk.CTkComboBox(
-            filter_bar,
-            values=["Усі", "DuplicateVertexRule", "DegenerateFaceRule", "NormalRule"],
-            width=160,
-            height=28,
-            fg_color="#121212",
-            border_color="#383838",
-            button_color="#2e2e2e",
-            button_hover_color="#3f3f3f",
-            text_color="#ffffff",
-            command=self._on_filter_issues
+        self.tree_models.column("name", width=190)
+        self.tree_models.column("verts", width=85, anchor="center")
+        self.tree_models.column("issues", width=75, anchor="center")
+        self.tree_models.column("status", width=120, anchor="center")
+        self.tree_models.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.tree_models.bind("<<TreeviewSelect>>", self._on_model_select)
+
+    def _build_issues_table(self, parent) -> None:
+        box = ctk.CTkFrame(parent)
+        box.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+
+        flt = ctk.CTkFrame(box, fg_color="transparent")
+        flt.pack(fill="x", padx=6, pady=(6, 4))
+        self.combo_rule_flt = ctk.CTkComboBox(
+            flt, width=155, values=["Усі правила", "DUPLICATE_VERTEX", "ZERO_NORMAL", "NOT_QUAD", "FLIPPED_NORMAL"],
+            command=lambda _v: self._refresh_issues_table()
         )
-        self.combo_rule_filter.pack(side="left", padx=4, pady=6)
+        self.combo_rule_flt.set("Усі правила")
+        self.combo_rule_flt.pack(side="left", padx=(0, 4))
 
-        ctk.CTkLabel(filter_bar, text="Критичність:", text_color="#cccccc").pack(side="left", padx=(8, 4), pady=6)
-        self.combo_sev_filter = ctk.CTkComboBox(
-            filter_bar,
-            values=["Усі", "Critical", "Warning", "Info"],
-            width=105,
-            height=28,
-            fg_color="#121212",
-            border_color="#383838",
-            button_color="#2e2e2e",
-            button_hover_color="#3f3f3f",
-            text_color="#ffffff",
-            command=self._on_filter_issues
+        self.combo_sev_flt = ctk.CTkComboBox(
+            flt, width=125, values=["Усі рівні", "Critical", "Warning", "Info"],
+            command=lambda _v: self._refresh_issues_table()
         )
-        self.combo_sev_filter.pack(side="left", padx=4, pady=6)
+        self.combo_sev_flt.set("Усі рівні")
+        self.combo_sev_flt.pack(side="left", padx=4)
 
-        self.btn_export_xml = ctk.CTkButton(
-            filter_bar, text="Експорт XML", width=110, height=28,
-            fg_color="#1f7a3f", hover_color="#175e30", text_color="#ffffff", state="disabled",
-            command=self._on_export_xml
+        ctk.CTkButton(flt, text="Експорт XML", width=105, fg_color="#2B7A0B", command=self._on_export_xml).pack(
+            side="right"
         )
-        self.btn_export_xml.pack(side="right", padx=(4, 8), pady=6)
 
-        issues_box = ctk.CTkFrame(left_panel, fg_color="#1c1c1c", border_width=1, border_color="#2e2e2e", corner_radius=6)
-        issues_box.grid(row=6, column=0, sticky="nsew", padx=10, pady=(6, 10))
-        issues_box.grid_columnconfigure(0, weight=1)
-        issues_box.grid_rowconfigure(0, weight=1)
+        cols = ("idx", "type", "sev", "desc")
+        self.tree_issues = ttk.Treeview(box, columns=cols, show="headings", height=7)
+        self.tree_issues.heading("idx", text="Елемент")
+        self.tree_issues.heading("type", text="Тип дефекту")
+        self.tree_issues.heading("sev", text="Критичність")
+        self.tree_issues.heading("desc", text="Опис")
 
-        self.tree_issues = ttk.Treeview(
-            issues_box,
-            columns=("idx", "type", "rule", "severity"),
-            show="headings",
-            style="Dark.Treeview",
-            height=9
-        )
-        self.tree_issues.heading("idx", text="Елемент #")
-        self.tree_issues.heading("type", text="Тип помилки")
-        self.tree_issues.heading("rule", text="Правило")
-        self.tree_issues.heading("severity", text="Критичність")
-        self.tree_issues.column("idx", width=85, anchor="center")
-        self.tree_issues.column("type", width=155, anchor="w")
-        self.tree_issues.column("rule", width=155, anchor="w")
-        self.tree_issues.column("severity", width=95, anchor="center")
-        self.tree_issues.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        self.tree_issues.bind("<<TreeviewSelect>>", self._on_select_issue_row)
+        self.tree_issues.column("idx", width=70, anchor="center")
+        self.tree_issues.column("type", width=130)
+        self.tree_issues.column("sev", width=85, anchor="center")
+        self.tree_issues.column("desc", width=210)
+        self.tree_issues.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.tree_issues.bind("<<TreeviewSelect>>", self._on_issue_select)
 
-        right_panel = ctk.CTkFrame(self, fg_color="#141414", border_width=1, border_color="#2a2a2a", corner_radius=8)
-        right_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 12), pady=12)
-        right_panel.grid_columnconfigure((0, 1), weight=1)
-        right_panel.grid_rowconfigure(2, weight=1)
+    def _build_canvas_panel(self, parent) -> None:
+        top = ctk.CTkFrame(parent, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(8, 4))
+        ctk.CTkLabel(top, text="Ортогональні проєкції 3D-сітки (XY та XZ)", font=("", 14, "bold")).pack(side="left")
+        ctk.CTkButton(top, text="Скинути вигляд", width=115, command=self._reset_view).pack(side="right")
 
-        dash_frame = ctk.CTkFrame(right_panel, fg_color="#1c1c1c", border_width=1, border_color="#2e2e2e", corner_radius=6)
-        dash_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(12, 8))
+        canv_box = ctk.CTkFrame(parent, fg_color="transparent")
+        canv_box.pack(fill="both", expand=True, padx=10, pady=4)
 
-        self.lbl_summary = ctk.CTkLabel(
-            dash_frame,
-            text="Завантажте .obj модель та натисніть «Перевірити» для візуалізації",
-            font=("Segoe UI", 12, "bold"),
-            text_color="#ffffff"
-        )
-        self.lbl_summary.pack(side="left", padx=12, pady=8)
+        self.canvas_xy = tk.Canvas(canv_box, bg="#141414", highlightthickness=1, highlightbackground="#333333")
+        self.canvas_xy.pack(side="left", fill="both", expand=True, padx=(0, 5))
 
-        ctk.CTkButton(dash_frame, text="Скинути вигляд", width=115, height=28, fg_color="#2e2e2e", hover_color="#3f3f3f", text_color="#ffffff", command=self._reset_view).pack(side="right", padx=12, pady=8)
+        self.canvas_xz = tk.Canvas(canv_box, bg="#141414", highlightthickness=1, highlightbackground="#333333")
+        self.canvas_xz.pack(side="right", fill="both", expand=True, padx=(5, 0))
 
-        ctk.CTkLabel(right_panel, text="Горизонтальна проєкція (XY):", text_color="#e0e0e0", font=("Segoe UI", 12, "bold")).grid(row=1, column=0, sticky="w", padx=14, pady=(4, 2))
-        ctk.CTkLabel(right_panel, text="Вертикальна проєкція (XZ):", text_color="#e0e0e0", font=("Segoe UI", 12, "bold")).grid(row=1, column=1, sticky="w", padx=14, pady=(4, 2))
-
-        self.canvas_xy = tk.Canvas(right_panel, width=340, height=340, bg="#0a0a0a", highlightthickness=1, highlightbackground="#333333")
-        self.canvas_xy.grid(row=2, column=0, sticky="nsew", padx=(12, 6), pady=6)
-
-        self.canvas_xz = tk.Canvas(right_panel, width=340, height=340, bg="#0a0a0a", highlightthickness=1, highlightbackground="#333333")
-        self.canvas_xz.grid(row=2, column=1, sticky="nsew", padx=(6, 12), pady=6)
+        for cv in (self.canvas_xy, self.canvas_xz):
+            cv.bind("<MouseWheel>", self._on_zoom)
+            cv.bind("<ButtonPress-1>", self._on_pan_start)
+            cv.bind("<B1-Motion>", self._on_pan_move)
+            cv.bind("<Configure>", lambda _e: self._redraw_projections())
 
         legend = (
-            "Легенда візуалізації:
-"
-            "• Сірі лінії — коректна сітка | Червоні лінії — дефектні грані | Білі точки — дублікати вершин
-"
-            "• Обраний елемент — яскраво-зелений акцент | Коліщатко миші — Zoom, ЛКМ — Pan"
+            "Легенда: Сірі лінії - нормальні грані | Червоні лінії - пошкоджені грані | "
+            "Жовті точки - дублікати вершин (Коліщатко - зум, ЛКМ - переміщення)"
         )
-        ctk.CTkLabel(right_panel, text=legend, justify="left", font=("Segoe UI", 11), text_color="#9e9e9e").grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=14, pady=(6, 12)
-        )
+        ctk.CTkLabel(parent, text=legend, text_color="#B0B0B0").pack(anchor="w", padx=10, pady=(2, 8))
 
-    def _on_rename_project(self):
-        try:
-            self.ctrl.rename_project(self.entry_project.get())
-            self.lbl_status.configure(text="Назву проєкту оновлено")
-        except Exception as e:
-            messagebox.showerror("Помилка валідації", str(e))
+    # ==================== СИНХРОНІЗАЦІЯ UI ====================
+    def _sync_project_ui(self) -> None:
+        names = self.ctrl.get_project_names()
+        self.combo_projects.configure(values=names)
+        self.combo_projects.set(self.ctrl.project.name)
+        self.entry_proj_name.delete(0, "end")
+        self.entry_proj_name.insert(0, self.ctrl.project.name)
 
-    def _on_new_project(self):
-        try:
-            name = self.entry_project.get().strip() or "New 3D Project"
-            self.ctrl.create_new_project(name)
-            self._refresh_models_table()
-            self._clear_issues_table()
-            self.canvas_xy.delete("all")
-            self.canvas_xz.delete("all")
-            self.lbl_status.configure(text=f"Створено проєкт '{name}'")
-        except Exception as e:
-            messagebox.showerror("Помилка", str(e))
+        for rule in self.ctrl.project.rules:
+            if isinstance(rule, DuplicateVertexRule):
+                self.var_dup.set(rule.enabled)
+                self.entry_tol_dup.delete(0, "end")
+                self.entry_tol_dup.insert(0, f"{rule.tolerance:g}")
+            elif isinstance(rule, DegenerateFaceRule):
+                self.var_deg.set(rule.enabled)
+                self.entry_tol_deg.delete(0, "end")
+                self.entry_tol_deg.insert(0, f"{rule.tolerance:g}")
+            elif isinstance(rule, NormalRule):
+                self.var_norm.set(rule.enabled)
+                self.entry_tol_norm.delete(0, "end")
+                self.entry_tol_norm.insert(0, f"{rule.tolerance:g}")
 
-    def _on_import_json(self):
-        path = filedialog.askopenfilename(title="Імпорт проєкту JSON", filetypes=[("JSON файли", "*.json")])
-        if not path:
-            return
-        try:
-            self.ctrl.import_project_json(path)
-            self.entry_project.delete(0, tk.END)
-            self.entry_project.insert(0, self.ctrl.project.name)
-            self._sync_rules_ui_from_project()
-            self._refresh_models_table()
-            messagebox.showinfo("Імпорт JSON", f"Проєкт '{self.ctrl.project.name}' успішно завантажено!")
-        except Exception as e:
-            messagebox.showerror("Помилка JSON", str(e))
+        self._refresh_models_table()
+        self._refresh_issues_table()
+        self._redraw_projections()
 
-    def _sync_rules_ui_from_project(self):
-        active_names = {r.name for r in self.ctrl.project.rules}
-        self.var_dup.set("DuplicateVertexRule" in active_names)
-        self.var_deg.set("DegenerateFaceRule" in active_names)
-        self.var_norm.set("NormalRule" in active_names)
-        if self.ctrl.project.rules:
-            self.entry_tol.delete(0, tk.END)
-            self.entry_tol.insert(0, str(self.ctrl.project.rules[0].tolerance))
-
-    def _on_apply_rules(self):
-        try:
-            enabled = {
-                "DuplicateVertexRule": self.var_dup.get(),
-                "DegenerateFaceRule": self.var_deg.get(),
-                "NormalRule": self.var_norm.get()
-            }
-            self.ctrl.update_rules(enabled, self.entry_tol.get())
-            self.lbl_status.configure(text="Правила та допуск збережено")
-        except Exception as e:
-            messagebox.showerror("Помилка правил", str(e))
-
-    def _on_browse_obj(self):
-        file_path = filedialog.askopenfilename(
-            title="Виберіть 3D-модель (.obj)",
-            filetypes=[("OBJ 3D моделі", "*.obj"), ("Усі файли", "*.*")]
-        )
-        if file_path:
-            self.entry_path.delete(0, tk.END)
-            self.entry_path.insert(0, file_path)
-
-    def _on_run_analysis(self):
-        try:
-            self._on_apply_rules()
-            file_path = self.entry_path.get()
-            self.ctrl.start_analysis(file_path)
-
-            self.progress_bar.set(0.05)
-            self.btn_run.configure(state="disabled")
-            self.btn_cancel.configure(state="normal")
-            self.btn_export_xml.configure(state="disabled")
-            self.after(80, self._poll_queue)
-        except Exception as e:
-            messagebox.showerror("Помилка запуску", str(e))
-
-    def _on_cancel_analysis(self):
-        self.ctrl.cancel_analysis()
-        self.btn_cancel.configure(state="disabled")
-
-    def _poll_queue(self):
-        keep_polling = True
-        while not self.ctrl.result_queue.empty():
-            try:
-                msg_type, payload, text_info = self.ctrl.result_queue.get_nowait()
-                if msg_type == "progress":
-                    self.progress_bar.set(payload)
-                    if text_info:
-                        self.lbl_status.configure(text=text_info)
-                elif msg_type == "cancelled":
-                    self.progress_bar.set(0)
-                    self.lbl_status.configure(text=text_info or "Скасовано")
-                    self.btn_run.configure(state="normal")
-                    self.btn_cancel.configure(state="disabled")
-                    keep_polling = False
-                elif msg_type == "error":
-                    self.progress_bar.set(0)
-                    self.lbl_status.configure(text="Помилка перевірки")
-                    self.btn_run.configure(state="normal")
-                    self.btn_cancel.configure(state="disabled")
-                    messagebox.showerror("Помилка аналізу OBJ", payload)
-                    keep_polling = False
-                elif msg_type == "success":
-                    self.progress_bar.set(1.0)
-                    self.lbl_status.configure(text=text_info or "Готово")
-                    self.btn_run.configure(state="normal")
-                    self.btn_cancel.configure(state="disabled")
-                    self.btn_export_xml.configure(state="normal")
-
-                    model_obj = payload
-                    self._refresh_models_table()
-                    self._display_model_results(model_obj)
-                    keep_polling = False
-            except queue.Empty:
-                break
-
-        if keep_polling:
-            self.after(80, self._poll_queue)
-
-    def _refresh_models_table(self):
+    def _refresh_models_table(self) -> None:
         for item in self.tree_models.get_children():
             self.tree_models.delete(item)
 
-        sort_choice = self.combo_sort.get()
-        sort_key = "errors"
-        if "Вершини" in sort_choice:
-            sort_key = "vertices"
-        elif "Назва" in sort_choice:
-            sort_key = "name"
+        query = self.entry_search.get().strip().lower()
+        sorted_list = self.ctrl.project.sort_models(by=self.sort_col, reverse=self.sort_reverse)
+        for m in sorted_list:
+            if query and query not in m.name.lower():
+                continue
+            status_txt = "Перевірено" if m.analyzed else "Не перевірено"
+            self.tree_models.insert("", "end", iid=m.name, values=(m.name, m.vertex_count, len(m.issues), status_txt))
 
-        models = self.ctrl.get_filtered_sorted_models(self.entry_search.get(), sort_key)
-        for m in models:
-            self.tree_models.insert("", "end", iid=m.name, values=(m.name, len(m.vertices), len(m.issues)))
-
-    def _on_select_model_row(self, _event):
-        sel = self.tree_models.selection()
-        if not sel:
-            return
-        model_obj = self.ctrl.project.get_model(sel[0])
-        if model_obj:
-            self.ctrl.current_model = model_obj
-            self.entry_path.delete(0, tk.END)
-            self.entry_path.insert(0, model_obj.file_path)
-            if not model_obj.issues:
-                model_obj.validate(self.ctrl.project.rules)
-            self._display_model_results(model_obj)
-            self.btn_export_xml.configure(state="normal")
-
-    def _on_delete_selected_model(self):
-        sel = self.tree_models.selection()
-        if not sel:
-            return
-        self.ctrl.delete_model(sel[0])
-        self._refresh_models_table()
-        self._clear_issues_table()
-
-    def _clear_issues_table(self):
+    def _refresh_issues_table(self) -> None:
         for item in self.tree_issues.get_children():
             self.tree_issues.delete(item)
 
-    def _on_filter_issues(self, _val=None):
-        self.active_rule_filter = self.combo_rule_filter.get()
-        self.active_severity_filter = self.combo_sev_filter.get()
-        if self.ctrl.current_model:
-            self._populate_issues_table(self.ctrl.current_model)
-            self._redraw_both_canvases()
+        model = self.ctrl.current_model
+        if model is None:
+            return
 
-    def _get_filtered_issues(self, model_obj):
-        res = model_obj.issues
-        if self.active_rule_filter != "Усі":
-            res = [i for i in res if i.rule_name == self.active_rule_filter]
-        if self.active_severity_filter != "Усі":
-            res = [i for i in res if i.severity == self.active_severity_filter]
-        return res
-
-    def _populate_issues_table(self, model_obj):
-        self._clear_issues_table()
-        filtered = self._get_filtered_issues(model_obj)
-        for idx, iss in enumerate(filtered[:500]):
+        r_flt = self.combo_rule_flt.get()
+        s_flt = self.combo_sev_flt.get()
+        for i, iss in enumerate(model.issues):
+            if r_flt != "Усі правила" and iss.error_type != r_flt:
+                continue
+            if s_flt != "Усі рівні" and iss.severity != s_flt:
+                continue
             self.tree_issues.insert(
-                "", "end", iid=f"{idx}_{iss.index}",
-                values=(iss.index, iss.error_type, iss.rule_name, iss.severity)
+                "", "end", iid=str(i), values=(f"#{iss.index}", iss.error_type, iss.severity, iss.description)
             )
 
-    def _display_model_results(self, model_obj):
-        self.lbl_summary.configure(
-            text=f"Модель: {model_obj.name} | Вершин: {len(model_obj.vertices)} | Граней: {len(model_obj.faces)} | Помилок: {len(model_obj.issues)}"
-        )
-        self._populate_issues_table(model_obj)
-        self._setup_canvas(self.canvas_xy, model_obj, lambda v: (v[0], v[1]))
-        self._setup_canvas(self.canvas_xz, model_obj, lambda v: (v[0], v[2]))
+    # ==================== ОБРОБНИКИ ПОДІЙ ====================
+    def _on_switch_project(self, selected_name: str) -> None:
+        self.ctrl.switch_project(selected_name)
+        self._sync_project_ui()
 
-    def _on_select_issue_row(self, _event):
-        sel = self.tree_issues.selection()
+    def _on_new_project(self) -> None:
+        name = simpledialog.askstring("Новий проєкт", "Введіть назву нового проєкту:", parent=self)
+        if name:
+            try:
+                self.ctrl.create_project(name)
+                self._sync_project_ui()
+            except Exception as exc:
+                messagebox.showerror("Помилка", str(exc))
+
+    def _on_rename_project(self) -> None:
+        try:
+            self.ctrl.rename_project(self.entry_proj_name.get())
+            self._sync_project_ui()
+        except Exception as exc:
+            messagebox.showerror("Помилка", str(exc))
+
+    def _on_delete_project(self) -> None:
+        if messagebox.askyesno("Підтвердження", f"Видалити проєкт «{self.ctrl.project.name}»?"):
+            self.ctrl.delete_active_project()
+            self._sync_project_ui()
+
+    def _on_import_json(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("JSON файли", "*.json")])
+        if path:
+            try:
+                self.ctrl.import_project_json(path)
+                self._sync_project_ui()
+            except Exception as exc:
+                messagebox.showerror("Помилка імпорту", str(exc))
+
+    def _on_export_json(self) -> None:
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON файли", "*.json")])
+        if path:
+            try:
+                self.ctrl.export_project_json(path)
+                messagebox.showinfo("Успіх", "Проєкт збережено у JSON.")
+            except Exception as exc:
+                messagebox.showerror("Помилка експорту", str(exc))
+
+    def _on_apply_rules(self) -> None:
+        try:
+            self.ctrl.update_rules(
+                dup_enabled=self.var_dup.get(),
+                dup_tol=float(self.entry_tol_dup.get()),
+                deg_enabled=self.var_deg.get(),
+                deg_tol=float(self.entry_tol_deg.get()),
+                norm_enabled=self.var_norm.get(),
+                norm_tol=float(self.entry_tol_norm.get()),
+            )
+            self.lbl_status.configure(text="Індивідуальні допуски правил збережено.", text_color="#4CC9F0")
+        except Exception as exc:
+            messagebox.showerror("Помилка валідації правил", str(exc))
+
+    def _on_browse_file(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("Wavefront OBJ", "*.obj")])
+        if path:
+            self.entry_file.delete(0, "end")
+            self.entry_file.insert(0, path)
+
+    def _on_add_model_crud(self) -> None:
+        dlg = ModelEditDialog(self, title="Додати 3D-модель у проєкт")
+        self.wait_window(dlg)
+        if dlg.result:
+            name, path = dlg.result
+            try:
+                self.ctrl.add_model_without_analysis(file_path=path, custom_name=name)
+                self._refresh_models_table()
+                self.lbl_status.configure(text=f"Модель «{name}» додано до проєкту.", text_color="#90BE6D")
+            except Exception as exc:
+                messagebox.showerror("Помилка", str(exc))
+
+    def _on_edit_model_crud(self) -> None:
+        sel = self.tree_models.selection()
+        if not sel:
+            messagebox.showinfo("Увага", "Оберіть модель у таблиці для редагування.")
+            return
+        old_name = sel[0]
+        model = self.ctrl.project.get_model(old_name)
+        if model is None:
+            return
+        dlg = ModelEditDialog(self, title="Редагувати модель", initial_name=model.name, initial_path=model.file_path)
+        self.wait_window(dlg)
+        if dlg.result:
+            new_name, new_path = dlg.result
+            try:
+                self.ctrl.edit_model(old_name, new_name, new_path)
+                self._refresh_models_table()
+                self._refresh_issues_table()
+                self._redraw_projections()
+                self.lbl_status.configure(text=f"Модель «{new_name}» оновлено.", text_color="#4CC9F0")
+            except Exception as exc:
+                messagebox.showerror("Помилка редагування", str(exc))
+
+    def _on_delete_model_crud(self) -> None:
+        sel = self.tree_models.selection()
         if not sel:
             return
-        vals = self.tree_issues.item(sel[0], "values")
-        if vals:
-            elem_idx = int(vals[0])
-            self._redraw_both_canvases(highlight_idx=elem_idx)
+        name = sel[0]
+        if messagebox.askyesno("Видалення", f"Видалити модель «{name}» із проєкту?"):
+            self.ctrl.delete_model(name)
+            self._refresh_models_table()
+            self._refresh_issues_table()
+            self._redraw_projections()
 
-    def _on_export_xml(self):
-        save_path = filedialog.asksaveasfilename(
-            defaultextension=".xml",
-            filetypes=[("XML звіти", "*.xml")],
-            title="Експорт звіту в XML"
-        )
-        if not save_path:
+    def _on_analyze_selected_model(self) -> None:
+        sel = self.tree_models.selection()
+        if not sel:
+            messagebox.showinfo("Увага", "Оберіть модель у таблиці.")
+            return
+        model = self.ctrl.project.get_model(sel[0])
+        if model:
+            self.entry_file.delete(0, "end")
+            self.entry_file.insert(0, model.file_path)
+            self._start_single_analysis(model.file_path, model.name)
+
+    def _on_run_single(self) -> None:
+        path = self.entry_file.get().strip()
+        self._start_single_analysis(path, None)
+
+    def _start_single_analysis(self, path: str, model_name: str | None) -> None:
+        try:
+            self._on_apply_rules()
+            self.progress_bar.set(0)
+            self.ctrl.start_analysis(path, model_name=model_name)
+        except Exception as exc:
+            messagebox.showerror("Помилка запуску", str(exc))
+
+    def _on_run_batch(self) -> None:
+        try:
+            self._on_apply_rules()
+            self.progress_bar.set(0)
+            self.ctrl.start_batch_project_analysis()
+        except Exception as exc:
+            messagebox.showerror("Помилка пакетної перевірки", str(exc))
+
+    def _on_cancel_analysis(self) -> None:
+        self.ctrl.cancel_analysis()
+        self.lbl_status.configure(text="Надсилання запиту на скасування...", text_color="#F9C74F")
+
+    def _on_export_xml(self) -> None:
+        path = filedialog.asksaveasfilename(defaultextension=".xml", filetypes=[("XML звіти", "*.xml")])
+        if path:
+            try:
+                self.ctrl.export_current_model_xml(path)
+                messagebox.showinfo("Експорт XML", "Звіт успішно сформовано.")
+            except Exception as exc:
+                messagebox.showerror("Помилка експорту", str(exc))
+
+    def _sort_models_by(self, col: str) -> None:
+        if self.sort_col == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_col = col
+            self.sort_reverse = False
+        self._refresh_models_table()
+
+    def _on_model_select(self, _event) -> None:
+        sel = self.tree_models.selection()
+        if not sel:
             return
         try:
-            self.ctrl.export_current_model_xml(save_path)
-            messagebox.showinfo("Експорт XML", f"Звіт успішно збережено:\n{save_path}")
-        except Exception as e:
-            messagebox.showerror("Помилка експорту", str(e))
+            self.ctrl.select_model_for_preview(sel[0])
+            self.highlighted_issue = None
+            self._refresh_issues_table()
+            self._redraw_projections()
+        except Exception as exc:
+            self.lbl_status.configure(text=f"Помилка завантаження геометрії: {exc}", text_color="#F94144")
 
-    def _setup_canvas(self, canvas, model_obj, coords_func):
-        vertices = model_obj.raw_data["vertices"]
-        if not vertices:
+    def _on_issue_select(self, _event) -> None:
+        sel = self.tree_issues.selection()
+        model = self.ctrl.current_model
+        if not sel or model is None:
             return
+        idx_in_list = int(sel[0])
+        if 0 <= idx_in_list < len(model.issues):
+            iss = model.issues[idx_in_list]
+            self.highlighted_issue = (iss.error_type, iss.index)
+            self._redraw_projections()
 
-        min_u = min(coords_func(v)[0] for v in vertices)
-        max_u = max(coords_func(v)[0] for v in vertices)
-        min_v = min(coords_func(v)[1] for v in vertices)
-        max_v = max(coords_func(v)[1] for v in vertices)
+    def _poll_queue(self) -> None:
+        try:
+            while True:
+                msg = self.ctrl.result_queue.get_nowait()
+                kind = msg[0]
+                if kind == "progress":
+                    _, pct, text = msg
+                    self.progress_bar.set(pct)
+                    self.lbl_status.configure(text=text, text_color="#4CC9F0")
+                elif kind == "done":
+                    _, model_obj, elapsed = msg
+                    self.progress_bar.set(1.0)
+                    self.lbl_status.configure(
+                        text=f"Готово ({elapsed:.2f} с): {model_obj.name} — помилок: {len(model_obj.issues)}",
+                        text_color="#90BE6D",
+                    )
+                    self._refresh_models_table()
+                    self._refresh_issues_table()
+                    self._redraw_projections()
+                elif kind == "batch_done":
+                    _, count, elapsed = msg
+                    self.progress_bar.set(1.0)
+                    self.lbl_status.configure(
+                        text=f"Пакетну перевірку завершено ({count} моделей за {elapsed:.2f} с).",
+                        text_color="#90BE6D",
+                    )
+                    self._refresh_models_table()
+                    self._refresh_issues_table()
+                    self._redraw_projections()
+                elif kind == "cancelled":
+                    self.progress_bar.set(0)
+                    self.lbl_status.configure(text=msg[1], text_color="#F9C74F")
+                elif kind == "error":
+                    self.progress_bar.set(0)
+                    self.lbl_status.configure(text=f"Помилка: {msg[1]}", text_color="#F94144")
+                    messagebox.showerror("Помилка аналізу", msg[1])
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
 
-        range_u = max_u - min_u if max_u != min_u else 1.0
-        range_v = max_v - min_v if max_v != min_v else 1.0
+    # ==================== 2D-ВІЗУАЛІЗАЦІЯ ПРОЄКЦІЙ ====================
+    def _reset_view(self) -> None:
+        self.zoom_scale = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._redraw_projections()
 
-        c_w = max(320, canvas.winfo_width())
-        c_h = max(320, canvas.winfo_height())
-        c_size = min(c_w, c_h)
-        margin = 25
-        base_scale = min((c_size - 2 * margin) / range_u, (c_size - 2 * margin) / range_v)
+    def _on_zoom(self, event) -> None:
+        factor = 1.15 if event.delta > 0 else 0.85
+        self.zoom_scale = max(0.2, min(15.0, self.zoom_scale * factor))
+        self._redraw_projections()
 
-        base_offset_u = (c_size - range_u * base_scale) / 2 - min_u * base_scale
-        base_offset_v = (c_size - range_v * base_scale) / 2 - min_v * base_scale
+    def _on_pan_start(self, event) -> None:
+        self._drag_start = (event.x, event.y)
 
-        self.canvas_states[canvas] = {
-            "zoom": 1.0,
-            "pan_x": 0.0,
-            "pan_y": 0.0,
-            "base_scale": base_scale,
-            "base_offset_u": base_offset_u,
-            "base_offset_v": base_offset_v,
-            "c_size": c_size,
-            "model": model_obj,
-            "coords_func": coords_func,
-            "drag_start": (0, 0),
-            "highlight_index": None,
-            "zoom_timer": None
-        }
-        self._redraw_canvas(canvas, fast_mode=False)
+    def _on_pan_move(self, event) -> None:
+        self.pan_x += event.x - self._drag_start[0]
+        self.pan_y += event.y - self._drag_start[1]
+        self._drag_start = (event.x, event.y)
+        self._redraw_projections()
 
-        canvas.bind("<ButtonPress-1>", lambda e, c=canvas: self._on_pan_start(c, e))
-        canvas.bind("<B1-Motion>", lambda e, c=canvas: self._on_pan_move(c, e))
-        canvas.bind("<ButtonRelease-1>", lambda e, c=canvas: self._on_pan_release(c, e))
-        canvas.bind("<MouseWheel>", lambda e, c=canvas: self._on_zoom(c, e))
+    def _redraw_projections(self) -> None:
+        self._draw_single_canvas(self.canvas_xy, mode="XY")
+        self._draw_single_canvas(self.canvas_xz, mode="XZ")
 
-    def _reset_view(self):
-        for canvas, state in self.canvas_states.items():
-            state["zoom"] = 1.0
-            state["pan_x"] = 0.0
-            state["pan_y"] = 0.0
-            state["highlight_index"] = None
-            self._redraw_canvas(canvas, fast_mode=False)
-
-    def _on_pan_start(self, canvas, event):
-        self.canvas_states[canvas]["drag_start"] = (event.x, event.y)
-
-    def _on_pan_move(self, canvas, event):
-        st = self.canvas_states[canvas]
-        dx = event.x - st["drag_start"][0]
-        dy = event.y - st["drag_start"][1]
-        st["drag_start"] = (event.x, event.y)
-        st["pan_x"] += dx
-        st["pan_y"] -= dy
-        self._redraw_canvas(canvas, fast_mode=True)
-
-    def _on_pan_release(self, canvas, _event):
-        self._redraw_canvas(canvas, fast_mode=False)
-
-    def _on_zoom(self, canvas, event):
-        st = self.canvas_states[canvas]
-        st["zoom"] *= 1.12 if event.delta > 0 else 0.88
-        self._redraw_canvas(canvas, fast_mode=True)
-
-        if st["zoom_timer"] is not None:
-            self.after_cancel(st["zoom_timer"])
-        st["zoom_timer"] = self.after(150, lambda c=canvas: self._finish_zoom(c))
-
-    def _finish_zoom(self, canvas):
-        st = self.canvas_states.get(canvas)
-        if st:
-            st["zoom_timer"] = None
-            self._redraw_canvas(canvas, fast_mode=False)
-
-    def _redraw_both_canvases(self, highlight_idx=None):
-        for c in (self.canvas_xy, self.canvas_xz):
-            if c in self.canvas_states:
-                self._redraw_canvas(c, highlight_idx=highlight_idx, fast_mode=False)
-
-    def _redraw_canvas(self, canvas, highlight_idx=None, fast_mode=False):
+    def _draw_single_canvas(self, canvas: tk.Canvas, mode: str) -> None:
         canvas.delete("all")
-        st = self.canvas_states.get(canvas)
-        if not st:
+        w = max(10, canvas.winfo_width())
+        h = max(10, canvas.winfo_height())
+        canvas.create_text(12, 12, anchor="nw", text=f"Проєкція {mode}", fill="#CCCCCC", font=("Arial", 10, "bold"))
+
+        model = self.ctrl.current_model
+        if model is None or not model.vertices:
             return
-        if highlight_idx is not None:
-            st["highlight_index"] = highlight_idx
 
-        model_obj = st["model"]
-        vertices = model_obj.raw_data["vertices"]
-        faces = model_obj.raw_data["faces"]
-        filtered_issues = self._get_filtered_issues(model_obj)
-        coords_func = st["coords_func"]
-        hl_idx = st["highlight_index"]
+        pts_2d = [(v.x, v.y) if mode == "XY" else (v.x, v.z) for v in model.vertices]
+        xs = [p[0] for p in pts_2d]
+        ys = [p[1] for p in pts_2d]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        span = max(max_x - min_x, max_y - min_y, 1e-6)
+        base_scale = (min(w, h) * 0.78) / span * self.zoom_scale
+        cx_mid = (min_x + max_x) * 0.5
+        cy_mid = (min_y + max_y) * 0.5
 
-        zoom = st["zoom"]
-        pan_x = st["pan_x"]
-        pan_y = st["pan_y"]
-        base_scale = st["base_scale"]
-        off_u = st["base_offset_u"]
-        off_v = st["base_offset_v"]
-        c_size = st["c_size"]
+        def to_screen(px: float, py: float) -> tuple[float, float]:
+            sx = w * 0.5 + (px - cx_mid) * base_scale + self.pan_x
+            sy = h * 0.5 - (py - cy_mid) * base_scale + self.pan_y
+            return sx, sy
 
-        def project(v):
-            u, w = coords_func(v)
-            px = u * base_scale * zoom + off_u * zoom + pan_x
-            py = c_size - (w * base_scale * zoom + off_v * zoom + pan_y)
-            return px, py
+        bad_faces = {iss.index for iss in model.issues if iss.error_type != "DUPLICATE_VERTEX"}
+        dup_verts = {iss.index for iss in model.issues if iss.error_type == "DUPLICATE_VERTEX"}
 
-        err_faces = {iss.index for iss in filtered_issues if iss.error_type != "DUPLICATE_VERTEX"}
+        step = max(1, len(model.faces) // 15000)
+        for f_idx in range(0, len(model.faces), step):
+            if f_idx in bad_faces:
+                continue
+            face = model.faces[f_idx]
+            coords = []
+            for vi in face.vertex_indices:
+                coords.extend(to_screen(*pts_2d[vi]))
+            if len(coords) >= 6:
+                canvas.create_polygon(coords, outline="#3E444C", fill="", width=1)
 
-        if not fast_mode:
-            drawn_edges = set()
-            step = max(1, len(faces) // 8000)
+        for f_idx in bad_faces:
+            if f_idx >= len(model.faces):
+                continue
+            face = model.faces[f_idx]
+            coords = []
+            for vi in face.vertex_indices:
+                coords.extend(to_screen(*pts_2d[vi]))
+            is_selected = self.highlighted_issue is not None and self.highlighted_issue[1] == f_idx
+            color = "#00F5D4" if is_selected else "#E63946"
+            width = 3 if is_selected else 1.5
+            if len(coords) >= 6:
+                canvas.create_polygon(coords, outline=color, fill="", width=width)
 
-            for idx, face in enumerate(faces):
-                is_err = (idx in err_faces) or (idx == hl_idx)
-                if not is_err and (idx % step != 0):
-                    continue
-
-                v_idxs = [int(it[0]) if isinstance(it, (tuple, list)) else int(it) for it in face]
-                pts = [project(vertices[vi]) for vi in v_idxs if 0 <= vi < len(vertices)]
-                if len(pts) < 2:
-                    continue
-
-                for i in range(len(pts)):
-                    e_key = tuple(sorted((v_idxs[i], v_idxs[(i + 1) % len(v_idxs)])))
-                    if not is_err and e_key in drawn_edges:
-                        continue
-                    drawn_edges.add(e_key)
-
-                    if idx == hl_idx:
-                        color = "#28a745"
-                        width = 3
-                    elif idx in err_faces:
-                        color = "#ff3b3b"
-                        width = 2
-                    else:
-                        color = "#2c2c2c"
-                        width = 1
-
-                    p0, p1 = pts[i], pts[(i + 1) % len(pts)]
-                    canvas.create_line(p0[0], p0[1], p1[0], p1[1], fill=color, width=width)
-
-        for iss in filtered_issues[:600]:
-            if iss.error_type == "DUPLICATE_VERTEX" and 0 <= iss.index < len(vertices):
-                px, py = project(vertices[iss.index])
-                c = "#28a745" if iss.index == hl_idx else "#ffffff"
-                r = 4 if iss.index == hl_idx else 3
-                canvas.create_oval(px - r, py - r, px + r, py + r, fill=c, outline="#0a0a0a")
-            elif fast_mode and iss.error_type != "DUPLICATE_VERTEX" and 0 <= iss.index < len(faces):
-                face = faces[iss.index]
-                xs, ys = [], []
-                for it in face:
-                    vi = int(it[0]) if isinstance(it, (tuple, list)) else int(it)
-                    if 0 <= vi < len(vertices):
-                        px, py = project(vertices[vi])
-                        xs.append(px)
-                        ys.append(py)
-                if xs and ys:
-                    cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
-                    c = "#28a745" if iss.index == hl_idx else "#ff3b3b"
-                    r = 4 if iss.index == hl_idx else 2.5
-                    canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=c, outline="#0a0a0a")
+        for v_idx in dup_verts:
+            if v_idx >= len(pts_2d):
+                continue
+            sx, sy = to_screen(*pts_2d[v_idx])
+            is_selected = (
+                self.highlighted_issue is not None
+                and self.highlighted_issue[0] == "DUPLICATE_VERTEX"
+                and self.highlighted_issue[1] == v_idx
+            )
+            r = 5 if is_selected else 3
+            fill = "#00F5D4" if is_selected else "#FFD166"
+            canvas.create_oval(sx - r, sy - r, sx + r, sy + r, fill=fill, outline="")
