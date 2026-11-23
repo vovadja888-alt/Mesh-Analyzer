@@ -1,108 +1,104 @@
 import os
-import logging
+import threading
+from typing import Callable
 
 
 class ObjParseError(Exception):
-    pass
+    """Спеціалізований виняток при пошкодженні або некоректній структурі OBJ-файлу."""
 
 
-def parse_obj(file_path: str) -> dict:
-    if not os.path.exists(file_path):
-        logging.error(f"Файл не знайдено: {file_path}")
-        raise FileNotFoundError(f"Файл не знайдено: {file_path}")
+class AnalysisCancelledError(Exception):
+    """Виняток кооперативного переривання операції користувачем."""
 
-    vertices = []
-    normals = []
-    faces = []
+
+def parse_obj(
+    file_path: str,
+    cancel_event: threading.Event | None = None,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> dict:
+    if not file_path or not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Файл моделі не знайдено: {file_path}")
+
+    file_size = os.path.getsize(file_path)
+    if file_size == 0:
+        raise ObjParseError("Файл моделі порожній.")
+
+    vertices: list[tuple[float, float, float]] = []
+    normals: list[tuple[float, float, float]] = []
+    faces: list[tuple[int, ...]] = []
+    bytes_read = 0
 
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, "r", encoding="utf-8", errors="strict") as f:
             for line_num, raw_line in enumerate(f, start=1):
+                bytes_read += len(raw_line.encode("utf-8"))
+
+                # Перевірка скасування та оновлення прогресу кожні 2000 рядків
+                if line_num % 2000 == 0:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise AnalysisCancelledError("Розбір OBJ-файлу скасовано користувачем.")
+                    if progress_callback is not None and file_size > 0:
+                        pct = min(0.45, (bytes_read / file_size) * 0.45)
+                        progress_callback(pct, f"Парсинг рядка {line_num:,}...")
+
                 line = raw_line.strip()
-                if not line or line.startswith('#'):
+                if not line or line.startswith("#"):
                     continue
 
                 parts = line.split()
                 prefix = parts[0]
 
-                if prefix == 'v':
+                if prefix == "v":
                     if len(parts) < 4:
-                        raise ObjParseError(f"Рядок {line_num}: некоректний запис вершини '{line}'")
+                        raise ObjParseError(f"Некоректна вершина у рядку {line_num}: {line}")
                     try:
-                        vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
-                    except ValueError as e:
-                        raise ObjParseError(f"Рядок {line_num}: помилка координат вершини ({e})") from e
+                        x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                    except ValueError as exc:
+                        raise ObjParseError(f"Помилка конвертації координат у рядку {line_num}") from exc
+                    vertices.append((x, y, z))
 
-                elif prefix == 'vn':
+                elif prefix == "vn":
                     if len(parts) < 4:
-                        raise ObjParseError(f"Рядок {line_num}: некоректний запис нормалі '{line}'")
+                        raise ObjParseError(f"Некоректна нормаль у рядку {line_num}: {line}")
                     try:
-                        normals.append((float(parts[1]), float(parts[2]), float(parts[3])))
-                    except ValueError as e:
-                        raise ObjParseError(f"Рядок {line_num}: помилка координат нормалі ({e})") from e
+                        nx, ny, nz = float(parts[1]), float(parts[2]), float(parts[3])
+                    except ValueError as exc:
+                        raise ObjParseError(f"Помилка конвертації нормалі у рядку {line_num}") from exc
+                    normals.append((nx, ny, nz))
 
-                elif prefix == 'f':
+                elif prefix == "f":
                     if len(parts) < 4:
-                        raise ObjParseError(f"Рядок {line_num}: грань містить менше 3 вершин")
-                    face_indices = []
-                    for p in parts[1:]:
-                        sub_parts = p.split('/')
+                        raise ObjParseError(f"Грань має менше 3 вершин у рядку {line_num}: {line}")
+                    face_indices: list[int] = []
+                    v_count = len(vertices)
+                    for token in parts[1:]:
+                        v_str = token.split("/")[0]
                         try:
-                            raw_v = int(sub_parts[0])
-                        except ValueError as e:
-                            raise ObjParseError(f"Рядок {line_num}: некоректний індекс вершини '{sub_parts[0]}'") from e
+                            raw_idx = int(v_str)
+                        except ValueError as exc:
+                            raise ObjParseError(f"Некоректний індекс вершини у рядку {line_num}") from exc
 
-                        v_idx = raw_v - 1 if raw_v > 0 else len(vertices) + raw_v
-                        if v_idx < 0 or v_idx >= len(vertices):
+                        if raw_idx == 0:
+                            raise IndexError(f"Нульовий індекс вершини неприпустимий у рядку {line_num}")
+                        idx = raw_idx - 1 if raw_idx > 0 else v_count + raw_idx
+                        if idx < 0 or idx >= v_count:
                             raise IndexError(
-                                f"Рядок {line_num}: індекс вершини {raw_v} поза межами (0..{len(vertices)-1})"
+                                f"Індекс вершини {raw_idx} виходить за межі [1..{v_count}] у рядку {line_num}"
                             )
+                        face_indices.append(idx)
+                    faces.append(tuple(face_indices))
 
-                        vn_idx = None
-                        if len(sub_parts) >= 3 and sub_parts[2]:
-                            try:
-                                raw_vn = int(sub_parts[2])
-                                vn_idx = raw_vn - 1 if raw_vn > 0 else len(normals) + raw_vn
-                            except ValueError:
-                                vn_idx = None
+    except UnicodeDecodeError as exc:
+        raise ObjParseError("Файл не є текстовим Wavefront OBJ (виявлено бінарні дані).") from exc
 
-                        face_indices.append((v_idx, vn_idx))
-                    faces.append(face_indices)
-
-    except UnicodeDecodeError as e:
-        logging.error(f"Пошкоджений файл або кодування: {file_path}")
-        raise ObjParseError(f"Файл '{file_path}' пошкоджений або має непідтримуване кодування") from e
+    if cancel_event is not None and cancel_event.is_set():
+        raise AnalysisCancelledError("Розбір OBJ-файлу скасовано користувачем.")
 
     if not vertices:
-        logging.error(f"Файл без вершин: {file_path}")
-        raise ObjParseError(f"Файл '{file_path}' не містить жодної вершини (v)")
+        raise ObjParseError("У файлі OBJ не знайдено жодної вершини (токен 'v').")
 
-    logging.info(f"Розібрано OBJ '{os.path.basename(file_path)}': {len(vertices)} вершин, {len(faces)} граней")
     return {
-        'vertices': vertices,
-        'normals': normals,
-        'faces': faces
+        "vertices": vertices,
+        "normals": normals,
+        "faces": faces,
     }
-
-
-def get_face_vertices(parsed_data: dict, face_indices: list) -> list:
-    all_verts = parsed_data['vertices']
-    face_coords = []
-
-    for item in face_indices:
-        idx = int(item[0]) if isinstance(item, (tuple, list)) else int(item)
-        if idx < 0 or idx >= len(all_verts):
-            raise IndexError(f"Індекс вершини {idx} виходить за межі масиву вершин")
-        face_coords.append(all_verts[idx])
-
-    return face_coords
-
-
-def calculate_object_center(vertices: list) -> tuple:
-    if not vertices:
-        return (0.0, 0.0, 0.0)
-    count = len(vertices)
-    cx = sum(v[0] for v in vertices) / count
-    cy = sum(v[1] for v in vertices) / count
-    cz = sum(v[2] for v in vertices) / count
-    return (cx, cy, cz)
