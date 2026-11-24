@@ -1,4 +1,5 @@
 # ШІ: Контролер MVC для координації фонового парсингу OBJ (threading.Thread) та паралельної перевірки правил (ProcessPoolExecutor). Змінено: додано маркування авторства та синхронізовано з оновленим DegenerateFaceRule.
+import json
 import logging
 import math
 import os
@@ -6,16 +7,17 @@ import queue
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import math_logic
 import obj_parser
 from domain_classes import (
-    DuplicateVertexRule,
     DegenerateFaceRule,
+    DuplicateVertexRule,
     Issue,
     Model3D,
     NormalRule,
     Project,
     ProjectStorage,
+    ValidationRule,
+    validate_model_chunk_worker,
 )
 
 
@@ -24,26 +26,21 @@ def _split_ranges(total: int, parts: int) -> list[tuple[int, int]]:
         return [(0, 0)]
     parts = max(1, min(parts, total))
     step = math.ceil(total / parts)
-    ranges = []
-    for start in range(0, total, step):
-        ranges.append((start, min(total, start + step)))
-    return ranges
+    return [(start, min(total, start + step)) for start in range(0, total, step)]
 
 
 def _batch_model_worker(model_name: str, file_path: str, rules_cfg: list[dict]) -> dict:
-    """Воркер для паралельної перевірки окремої моделі при пакетному запуску по проєкту."""
+    """Воркер для паралельної перевірки окремої моделі через поліморфний Model3D.validate()."""
     raw = obj_parser.parse_obj(file_path)
-    verts = raw["vertices"]
-    faces = raw["faces"]
-    raw_issues = math_logic.validate_model_chunk_worker(
-        verts, faces, (0, len(verts)), (0, len(faces)), rules_cfg
-    )
+    rules = [ValidationRule.from_dict(cfg) for cfg in rules_cfg]
+    model = Model3D(name=model_name, file_path=file_path, raw_data=raw)
+    model.validate(rules)
     return {
-        "name": model_name,
-        "file_path": file_path,
-        "vertex_count": len(verts),
-        "face_count": len(faces),
-        "issues": raw_issues,
+        "name": model.name,
+        "file_path": model.file_path,
+        "vertex_count": model.vertex_count,
+        "face_count": model.face_count,
+        "issues": [iss.to_dict() for iss in model.issues],
     }
 
 
@@ -56,7 +53,7 @@ class MeshAnalyzerController:
         self.result_queue: queue.Queue = queue.Queue()
         self._worker_thread: threading.Thread | None = None
 
-    #  CRUD ПРОЄКТІВ
+    # CRUD ПРОЄКТІВ
     def get_project_names(self) -> list[str]:
         return list(self.storage.projects.keys())
 
@@ -99,11 +96,10 @@ class MeshAnalyzerController:
     def export_project_json(self, json_path: str) -> None:
         self.storage.save_all()
         with open(json_path, "w", encoding="utf-8") as f:
-            import json
             json.dump(self.project.to_dict(), f, ensure_ascii=False, indent=2)
         logging.info("Експортовано проєкт «%s» у %s", self.project.name, json_path)
 
-    #CRUD ПРАВИЛ (ОКРЕМІ ДОПУСКИ)
+    # CRUD ПРАВИЛ (ОКРЕМІ ДОПУСКИ)
     def update_rules(
         self,
         dup_enabled: bool,
@@ -161,7 +157,7 @@ class MeshAnalyzerController:
         self.current_model = model
         return model
 
-    #ПАРАЛЕЛЬНИЙ АНАЛІЗ ЧАСТИН ОДНІЄЇ МОДЕЛІ 
+    # ПАРАЛЕЛЬНИЙ АНАЛІЗ ЧАСТИН ОДНІЄЇ МОДЕЛІ
     def start_analysis(self, file_path: str, model_name: str | None = None) -> None:
         if self._worker_thread and self._worker_thread.is_alive():
             raise RuntimeError("Аналіз уже виконується. Дочекайтеся завершення або натисніть «Скасувати».")
@@ -204,32 +200,33 @@ class MeshAnalyzerController:
             if len(verts) < 2000 and len(faces) < 2000:
                 workers_count = 1
 
-            v_ranges = _split_ranges(len(verts), workers_count)
-            f_ranges = _split_ranges(len(faces), workers_count)
-            chunks_total = max(len(v_ranges), len(f_ranges))
-
-            self.result_queue.put(
-                ("progress", 0.50, f"Паралельна перевірка {chunks_total} частин моделі ({workers_count} проц.)...")
-            )
-
-            collected_dicts: list[dict] = []
             if workers_count == 1:
-                collected_dicts = math_logic.validate_model_chunk_worker(
-                    verts, faces, (0, len(verts)), (0, len(faces)), rules_cfg
-                )
+                self.result_queue.put(("progress", 0.55, "Перевірка геометрії моделі..."))
+                rules = [ValidationRule.from_dict(cfg) for cfg in rules_cfg]
+                model_obj.validate(rules)
             else:
+                v_ranges = _split_ranges(len(verts), workers_count)
+                f_ranges = _split_ranges(len(faces), workers_count)
+                chunks_total = max(len(v_ranges), len(f_ranges))
+
+                self.result_queue.put(
+                    ("progress", 0.50, f"Паралельна перевірка {chunks_total} частин моделі ({workers_count} проц.)...")
+                )
+
+                collected_dicts: list[dict] = []
                 with ProcessPoolExecutor(max_workers=workers_count) as executor:
                     futures = []
                     for i in range(chunks_total):
-                        vr = v_ranges[i] if i < len(v_ranges) else (0, 0)
-                        fr = f_ranges[i] if i < len(f_ranges) else (0, 0)
+                        v_start, v_end = v_ranges[i] if i < len(v_ranges) else (0, 0)
+                        f_start, f_end = f_ranges[i] if i < len(f_ranges) else (0, 0)
                         futures.append(
                             executor.submit(
-                                math_logic.validate_model_chunk_worker,
-                                verts,
-                                faces,
-                                vr,
-                                fr,
+                                validate_model_chunk_worker,
+                                verts[v_start:v_end],
+                                faces[f_start:f_end],
+                                verts if f_start < f_end else [],
+                                v_start,
+                                f_start,
                                 rules_cfg,
                             )
                         )
@@ -245,8 +242,8 @@ class MeshAnalyzerController:
                         pct = 0.50 + 0.45 * (done_cnt / chunks_total)
                         self.result_queue.put(("progress", pct, f"Оброблено частин моделі: {done_cnt}/{chunks_total}"))
 
-            issues = [Issue.from_dict(d) for d in collected_dicts]
-            model_obj.set_issues_deduplicated(issues)
+                model_obj.set_issues_deduplicated([Issue.from_dict(d) for d in collected_dicts])
+
             self.project.add_model(model_obj)
             self.current_model = model_obj
             self.storage.save_all()
