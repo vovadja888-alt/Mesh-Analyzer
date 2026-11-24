@@ -1,104 +1,120 @@
+import math
 import os
-import threading
-from typing import Callable
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import obj_parser
+from domain_classes import (
+    DegenerateFaceRule,
+    DuplicateVertexRule,
+    Issue,
+    Model3D,
+    NormalRule,
+    validate_model_chunk_worker,
+)
 
 
-class ObjParseError(Exception):
-    """Спеціалізований виняток при пошкодженні або некоректній структурі OBJ-файлу."""
+def _split_ranges(total: int, parts: int) -> list[tuple[int, int]]:
+    if total <= 0:
+        return [(0, 0)]
+    parts = max(1, min(parts, total))
+    step = math.ceil(total / parts)
+    return [(s, min(total, s + step)) for s in range(0, total, step)]
 
 
-class AnalysisCancelledError(Exception):
-    """Виняток кооперативного переривання операції користувачем."""
+def _deduplicate_dicts(raw_issues: list[dict]) -> list[Issue]:
+    seen: set[tuple[str, int]] = set()
+    unique: list[Issue] = []
+    for d in raw_issues:
+        iss = Issue.from_dict(d)
+        key = (iss.error_type, iss.index)
+        if key not in seen:
+            seen.add(key)
+            unique.append(iss)
+    return unique
 
 
-def parse_obj(
-    file_path: str,
-    cancel_event: threading.Event | None = None,
-    progress_callback: Callable[[float, str], None] | None = None,
-) -> dict:
-    if not file_path or not os.path.isfile(file_path):
-        raise FileNotFoundError(f"Файл моделі не знайдено: {file_path}")
+def run_benchmark(file_path: str, workers: int = 4) -> None:
+    if not os.path.isfile(file_path):
+        print(f"Файл не знайдено: {file_path}")
+        return
 
-    file_size = os.path.getsize(file_path)
-    if file_size == 0:
-        raise ObjParseError("Файл моделі порожній.")
+    print(f"Завантаження моделі: {file_path} ...")
+    raw = obj_parser.parse_obj(file_path)
+    verts = raw["vertices"]
+    faces = raw["faces"]
+    print(f"Вершин: {len(verts):,} | Граней: {len(faces):,} | Виконавців (частин моделі): n = {workers}\n")
 
-    vertices: list[tuple[float, float, float]] = []
-    normals: list[tuple[float, float, float]] = []
-    faces: list[tuple[int, ...]] = []
-    bytes_read = 0
+    rules = [
+        DuplicateVertexRule(tolerance=1e-6, enabled=True),
+        DegenerateFaceRule(tolerance=1e-12, enabled=True),
+        NormalRule(tolerance=1e-12, enabled=True),
+    ]
+    rules_cfg = [r.to_dict() for r in rules]
 
-    try:
-        with open(file_path, "r", encoding="utf-8", errors="strict") as f:
-            for line_num, raw_line in enumerate(f, start=1):
-                bytes_read += len(raw_line.encode("utf-8"))
+    v_ranges = _split_ranges(len(verts), workers)
+    f_ranges = _split_ranges(len(faces), workers)
+    chunks = max(len(v_ranges), len(f_ranges))
 
-                # Перевірка скасування та оновлення прогресу кожні 2000 рядків
-                if line_num % 2000 == 0:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise AnalysisCancelledError("Розбір OBJ-файлу скасовано користувачем.")
-                    if progress_callback is not None and file_size > 0:
-                        pct = min(0.45, (bytes_read / file_size) * 0.45)
-                        progress_callback(pct, f"Парсинг рядка {line_num:,}...")
+    # 1. Однопотоковий режим (T1) — класичний ООП-виклик model.validate(rules) -> rule.check()
+    model_single = Model3D(name="benchmark_single", file_path=file_path, raw_data=raw)
+    t0 = time.perf_counter()
+    res_single = model_single.validate(rules)
+    t1 = time.perf_counter() - t0
 
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
+    # 2. ThreadPoolExecutor (перевірка виділених сегментів моделі у потоках через rule.check())
+    t0 = time.perf_counter()
+    raw_threads: list[dict] = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = []
+        for i in range(chunks):
+            v_start, v_end = v_ranges[i] if i < len(v_ranges) else (0, 0)
+            f_start, f_end = f_ranges[i] if i < len(f_ranges) else (0, 0)
+            futs.append(
+                ex.submit(
+                    validate_model_chunk_worker,
+                    verts[v_start:v_end],
+                    faces[f_start:f_end],
+                    verts if f_start < f_end else [],
+                    v_start,
+                    f_start,
+                    rules_cfg,
+                )
+            )
+        for f in as_completed(futs):
+            raw_threads.extend(f.result())
+    res_threads = _deduplicate_dicts(raw_threads)
+    t_thread = time.perf_counter() - t0
 
-                parts = line.split()
-                prefix = parts[0]
+    # 3. ProcessPoolExecutor (перевірка виділених сегментів моделі у процесах через rule.check())
+    t0 = time.perf_counter()
+    raw_procs: list[dict] = []
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        futs = []
+        for i in range(chunks):
+            v_start, v_end = v_ranges[i] if i < len(v_ranges) else (0, 0)
+            f_start, f_end = f_ranges[i] if i < len(f_ranges) else (0, 0)
+            futs.append(
+                ex.submit(
+                    validate_model_chunk_worker,
+                    verts[v_start:v_end],
+                    faces[f_start:f_end],
+                    verts if f_start < f_end else [],
+                    v_start,
+                    f_start,
+                    rules_cfg,
+                )
+            )
+        for f in as_completed(futs):
+            raw_procs.extend(f.result())
+    res_procs = _deduplicate_dicts(raw_procs)
+    t_proc = time.perf_counter() - t0
 
-                if prefix == "v":
-                    if len(parts) < 4:
-                        raise ObjParseError(f"Некоректна вершина у рядку {line_num}: {line}")
-                    try:
-                        x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
-                    except ValueError as exc:
-                        raise ObjParseError(f"Помилка конвертації координат у рядку {line_num}") from exc
-                    vertices.append((x, y, z))
+    print(f"1. Однопотоковий режим (T1):   {t1:.4f} с | Помилок: {len(res_single)} | S = 1.00x")
+    print(f"2. ThreadPoolExecutor (n={workers}):  {t_thread:.4f} с | Помилок: {len(res_threads)} | S = {t1 / t_thread:.2f}x")
+    print(f"3. ProcessPoolExecutor (n={workers}): {t_proc:.4f} с | Помилок: {len(res_procs)} | S = {t1 / t_proc:.2f}x")
 
-                elif prefix == "vn":
-                    if len(parts) < 4:
-                        raise ObjParseError(f"Некоректна нормаль у рядку {line_num}: {line}")
-                    try:
-                        nx, ny, nz = float(parts[1]), float(parts[2]), float(parts[3])
-                    except ValueError as exc:
-                        raise ObjParseError(f"Помилка конвертації нормалі у рядку {line_num}") from exc
-                    normals.append((nx, ny, nz))
 
-                elif prefix == "f":
-                    if len(parts) < 4:
-                        raise ObjParseError(f"Грань має менше 3 вершин у рядку {line_num}: {line}")
-                    face_indices: list[int] = []
-                    v_count = len(vertices)
-                    for token in parts[1:]:
-                        v_str = token.split("/")[0]
-                        try:
-                            raw_idx = int(v_str)
-                        except ValueError as exc:
-                            raise ObjParseError(f"Некоректний індекс вершини у рядку {line_num}") from exc
-
-                        if raw_idx == 0:
-                            raise IndexError(f"Нульовий індекс вершини неприпустимий у рядку {line_num}")
-                        idx = raw_idx - 1 if raw_idx > 0 else v_count + raw_idx
-                        if idx < 0 or idx >= v_count:
-                            raise IndexError(
-                                f"Індекс вершини {raw_idx} виходить за межі [1..{v_count}] у рядку {line_num}"
-                            )
-                        face_indices.append(idx)
-                    faces.append(tuple(face_indices))
-
-    except UnicodeDecodeError as exc:
-        raise ObjParseError("Файл не є текстовим Wavefront OBJ (виявлено бінарні дані).") from exc
-
-    if cancel_event is not None and cancel_event.is_set():
-        raise AnalysisCancelledError("Розбір OBJ-файлу скасовано користувачем.")
-
-    if not vertices:
-        raise ObjParseError("У файлі OBJ не знайдено жодної вершини (токен 'v').")
-
-    return {
-        "vertices": vertices,
-        "normals": normals,
-        "faces": faces,
-    }
+if __name__ == "__main__":
+    target = sys.argv[1] if len(sys.argv) > 1 else "test_models/тело1.obj"
+    run_benchmark(target, workers=4)
