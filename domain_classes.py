@@ -1,9 +1,17 @@
 import json
+import logging
 import os
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import math_logic
+
+logging.basicConfig(
+    filename="mesh_analyzer.log",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    encoding="utf-8",
+)
 
 
 class Reportable(ABC):
@@ -48,6 +56,8 @@ class Issue:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Issue":
+        if not isinstance(data, dict):
+            raise ValueError("Некоректний формат запису помилки (очікується словник).")
         return cls(
             index=int(data["index"]),
             error_type=str(data["error_type"]),
@@ -89,6 +99,8 @@ class ValidationRule(ABC):
 
     @classmethod
     def from_dict(cls, data: dict) -> "ValidationRule":
+        if not isinstance(data, dict):
+            raise ValueError("Некоректний формат правила перевірки у JSON.")
         r_type = data.get("type", "")
         tol = float(data.get("tolerance", 1e-6))
         enabled = bool(data.get("enabled", True))
@@ -329,6 +341,7 @@ class Model3D(Reportable):
         tree = ET.ElementTree(root)
         ET.indent(tree, space="  ")
         tree.write(save_path, encoding="utf-8", xml_declaration=True)
+        logging.info("Експортовано XML-звіт для моделі «%s» у %s", self.name, save_path)
 
     def to_dict(self) -> dict:
         return {
@@ -342,13 +355,20 @@ class Model3D(Reportable):
 
     @classmethod
     def from_dict(cls, data: dict) -> "Model3D":
+        if not isinstance(data, dict):
+            raise ValueError("Некоректний формат опису моделі у JSON.")
+        if "name" not in data or "file_path" not in data:
+            raise ValueError("У записі моделі відсутні обов'язкові поля 'name' або 'file_path'.")
+        issues_raw = data.get("issues", [])
+        if not isinstance(issues_raw, list):
+            raise ValueError("Поле 'issues' моделі у JSON має бути списком.")
         return cls(
-            name=data["name"],
-            file_path=data["file_path"],
+            name=str(data["name"]),
+            file_path=str(data["file_path"]),
             analyzed=bool(data.get("analyzed", False)),
             vertex_count=int(data.get("vertex_count", 0)),
             face_count=int(data.get("face_count", 0)),
-            issues=[Issue.from_dict(x) for x in data.get("issues", [])],
+            issues=[Issue.from_dict(x) for x in issues_raw],
         )
 
 
@@ -466,57 +486,89 @@ class Project:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Project":
-        rules = [ValidationRule.from_dict(r) for r in data.get("rules", [])]
-        models = [Model3D.from_dict(m) for m in data.get("models", [])]
-        return cls(name=data.get("name", "Без назви"), models=models, rules=rules if rules else None)
+        if not isinstance(data, dict):
+            raise ValueError("Некоректний формат проєкту у JSON (очікується об'єкт).")
+        if "name" not in data or not str(data["name"]).strip():
+            raise ValueError("У проєкті відсутня обов'язкова назва ('name').")
+
+        rules_raw = data.get("rules", [])
+        models_raw = data.get("models", [])
+        if not isinstance(rules_raw, list) or not isinstance(models_raw, list):
+            raise ValueError("Поля 'rules' та 'models' проєкту мають бути списками.")
+
+        rules = [ValidationRule.from_dict(r) for r in rules_raw]
+        models = [Model3D.from_dict(m) for m in models_raw]
+        return cls(name=str(data["name"]), models=models, rules=rules if rules else None)
 
 
 class ProjectStorage:
-    """Менеджер зберігання та завантаження кількох проєктів у JSON-файлі."""
+    """Менеджер зберігання та завантаження кількох проєктів у JSON-файлі з перевіркою цілісності."""
 
     def __init__(self, storage_path: str = "projects.json"):
         self.storage_path = storage_path
         self.projects: dict[str, Project] = {}
         self.active_project_name: str = ""
 
-    def load_all(self) -> Project:
+    def load_all(self, strict: bool = True) -> Project:
         if not os.path.isfile(self.storage_path):
             default_proj = Project("Проєкт за замовчуванням")
             self.projects = {default_proj.name: default_proj}
             self.active_project_name = default_proj.name
             self.save_all()
+            logging.info("Створено новий файл сховища проєктів: %s", self.storage_path)
             return default_proj
 
         try:
             with open(self.storage_path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-        except Exception:
-            raw = {}
 
-        if isinstance(raw, dict) and "projects" not in raw and "name" in raw:
-            proj = Project.from_dict(raw)
-            self.projects = {proj.name: proj}
-            self.active_project_name = proj.name
-            self.save_all()
-            return proj
+            if not isinstance(raw, dict):
+                raise ValueError("Кореневий елемент JSON має бути об'єктом (словником).")
 
-        self.projects.clear()
-        if isinstance(raw, dict):
-            for p_data in raw.get("projects", []):
+            # Формат одного проєкту (експортований JSON)
+            if "projects" not in raw and "name" in raw:
+                proj = Project.from_dict(raw)
+                self.projects = {proj.name: proj}
+                self.active_project_name = proj.name
+                logging.info("Завантажено проєкт «%s» з %s", proj.name, self.storage_path)
+                return proj
+
+            # Формат мультипроєктного сховища
+            if "projects" not in raw or not isinstance(raw["projects"], list):
+                raise ValueError("У JSON відсутній коректний список проєктів ('projects').")
+
+            loaded_projects: dict[str, Project] = {}
+            for p_data in raw["projects"]:
                 proj = Project.from_dict(p_data)
-                self.projects[proj.name] = proj
+                loaded_projects[proj.name] = proj
 
-        if not self.projects:
+            if not loaded_projects:
+                raise ValueError("Список проєктів у JSON порожній.")
+
+            self.projects = loaded_projects
+            active_name = raw.get("active_project", "")
+            if isinstance(active_name, str) and active_name in self.projects:
+                self.active_project_name = active_name
+            else:
+                self.active_project_name = next(iter(self.projects))
+
+            logging.info(
+                "Завантажено %d проєкт(ів) із %s (активний: «%s»)",
+                len(self.projects),
+                self.storage_path,
+                self.active_project_name,
+            )
+            return self.projects[self.active_project_name]
+
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError, KeyError, ValueError, TypeError) as exc:
+            logging.error("Помилка завантаження JSON-файлу «%s»: %s", self.storage_path, exc)
+            if strict:
+                raise ValueError(f"Пошкоджений або некоректний JSON-файл ({self.storage_path}): {exc}") from exc
+
             default_proj = Project("Проєкт за замовчуванням")
-            self.projects[default_proj.name] = default_proj
-
-        active_name = raw.get("active_project", "") if isinstance(raw, dict) else ""
-        if active_name in self.projects:
-            self.active_project_name = active_name
-        else:
-            self.active_project_name = next(iter(self.projects))
-
-        return self.projects[self.active_project_name]
+            self.projects = {default_proj.name: default_proj}
+            self.active_project_name = default_proj.name
+            return default_proj
 
     def save_all(self) -> None:
         payload = {
