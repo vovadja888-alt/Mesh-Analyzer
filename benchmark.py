@@ -2,6 +2,7 @@ import math
 import os
 import sys
 import time
+import zipfile
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import obj_parser
 from domain_classes import (
@@ -32,6 +33,39 @@ def _deduplicate_dicts(raw_issues: list[dict]) -> list[Issue]:
             seen.add(key)
             unique.append(iss)
     return unique
+
+
+def _resolve_model_path() -> str:
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.join(base_dir, "test_models")
+    zip_path = os.path.join(base_dir, "test_models.zip")
+
+    if not os.path.isdir(models_dir) and os.path.isfile(zip_path):
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(base_dir)
+
+    candidates = [
+        os.path.join(models_dir, "тело1 .obj"),
+        os.path.join(models_dir, "тело1.obj"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+
+    if os.path.isdir(models_dir):
+        obj_files: list[str] = []
+        for root, _, files in os.walk(models_dir):
+            for fname in files:
+                low = fname.lower()
+                if low.endswith(".obj") and "broken" not in low and "corrupt" not in low:
+                    obj_files.append(os.path.join(root, fname))
+        if obj_files:
+            return max(obj_files, key=os.path.getsize)
+
+    return candidates[0]
 
 
 def run_benchmark(file_path: str, workers: int = 4) -> None:
@@ -116,5 +150,4 @@ def run_benchmark(file_path: str, workers: int = 4) -> None:
 
 
 if __name__ == "__main__":
-    target = sys.argv[1] if len(sys.argv) > 1 else "test_models/тело1.obj"
-    run_benchmark(target, workers=4)
+    run_benchmark(_resolve_model_path(), workers=4)
