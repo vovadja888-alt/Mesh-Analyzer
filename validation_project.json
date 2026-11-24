@@ -1,175 +1,110 @@
 {
-  "projectVersion": "1.0",
-  "projectName": "Coursework_10_Models_Test",
-  "createdAt": "2026-11-24T15:24:00Z",
-  "validationSettings": {
-    "checkNgons": true,
-    "maxPolygonVertices": 4,
-    "checkFlippedNormals": true,
-    "checkIsolatedVertices": true,
-    "checkDuplicateVertices": true,
-    "duplicateTolerance": 0.0001
-  },
-  "models": [
+  "active_project": "Тестовий набір (10 моделей)",
+  "projects": [
     {
-      "id": 1,
-      "fileName": "1 model mouse.obj",
-      "filePath": "Models/1 model mouse.obj",
-      "isValid": false,
-      "stats": {
-        "vertices": 11893,
-        "faces": 10535,
-        "tris": 211,
-        "quads": 8162,
-        "ngons": 2162,
-        "flippedNormals": 27,
-        "isolatedVertices": 0,
-        "duplicateVertices": 0
-      }
-    },
-    {
-      "id": 2,
-      "fileName": "Keyboard.obj",
-      "filePath": "Models/Keyboard.obj",
-      "isValid": false,
-      "stats": {
-        "vertices": 17449,
-        "faces": 15772,
-        "tris": 143,
-        "quads": 15204,
-        "ngons": 425,
-        "flippedNormals": 11,
-        "isolatedVertices": 2,
-        "duplicateVertices": 0
-      }
-    },
-    {
-      "id": 3,
-      "fileName": "model 3 can normals.obj",
-      "filePath": "Models/model 3 can normals.obj",
-      "isValid": false,
-      "stats": {
-        "vertices": 53376,
-        "faces": 53376,
-        "tris": 0,
-        "quads": 53376,
-        "ngons": 0,
-        "flippedNormals": 4,
-        "isolatedVertices": 0,
-        "duplicateVertices": 0
-      }
-    },
-    {
-      "id": 4,
-      "fileName": "6 model cube.obj",
-      "filePath": "Models/6 model cube.obj",
-      "isValid": false,
-      "stats": {
-        "vertices": 388,
-        "faces": 384,
-        "tris": 0,
-        "quads": 381,
-        "ngons": 3,
-        "flippedNormals": 5,
-        "isolatedVertices": 0,
-        "duplicateVertices": 0
-      }
-    },
-    {
-      "id": 5,
-      "fileName": "model 8 clock flipped normals_dublicates.obj",
-      "filePath": "Models/model 8 clock flipped normals_dublicates.obj",
-      "isValid": false,
-      "stats": {
-        "vertices": 30402,
-        "faces": 24492,
-        "tris": 3544,
-        "quads": 20889,
-        "ngons": 59,
-        "flippedNormals": 53,
-        "isolatedVertices": 0,
-        "duplicateVertices": 268
-      }
-    },
-    {
-      "id": 6,
-      "fileName": "Catan.obj",
-      "filePath": "Models/Catan.obj",
-      "isValid": false,
-      "stats": {
-        "vertices": 503571,
-        "faces": 505080,
-        "tris": 486,
-        "quads": 502248,
-        "ngons": 2346,
-        "flippedNormals": 2231,
-        "isolatedVertices": 12,
-        "duplicateVertices": 390
-      }
-    },
-    {
-      "id": 7,
-      "fileName": "Radio.obj",
-      "filePath": "Models/Radio.obj",
-      "isValid": false,
-      "stats": {
-        "vertices": 36829,
-        "faces": 35933,
-        "tris": 70,
-        "quads": 35756,
-        "ngons": 107,
-        "flippedNormals": 23,
-        "isolatedVertices": 0,
-        "duplicateVertices": 900
-      }
-    },
-    {
-      "id": 8,
-      "fileName": "Table.obj",
-      "filePath": "Models/Table.obj",
-      "isValid": false,
-      "stats": {
-        "vertices": 42243,
-        "faces": 41123,
-        "tris": 654,
-        "quads": 40350,
-        "ngons": 119,
-        "flippedNormals": 23,
-        "isolatedVertices": 0,
-        "duplicateVertices": 804
-      }
-    },
-    {
-      "id": 9,
-      "fileName": "Wardrobe.obj",
-      "filePath": "Models/Wardrobe.obj",
-      "isValid": true,
-      "stats": {
-        "vertices": 1640,
-        "faces": 1608,
-        "tris": 0,
-        "quads": 1608,
-        "ngons": 0,
-        "flippedNormals": 0,
-        "isolatedVertices": 0,
-        "duplicateVertices": 8
-      }
-    },
-    {
-      "id": 10,
-      "fileName": "aphex_twin.obj",
-      "filePath": "Models/aphex_twin.obj",
-      "isValid": true,
-      "stats": {
-        "vertices": 774,
-        "faces": 877,
-        "tris": 234,
-        "quads": 643,
-        "ngons": 0,
-        "flippedNormals": 0,
-        "isolatedVertices": 0,
-        "duplicateVertices": 0
-      }
+      "name": "Тестовий набір (10 моделей)",
+      "rules": [
+        {
+          "type": "DuplicateVertexRule",
+          "name": "Дублікати вершин",
+          "tolerance": 1e-06,
+          "enabled": true
+        },
+        {
+          "type": "DegenerateFaceRule",
+          "name": "Вироджені та n-гони",
+          "tolerance": 1e-12,
+          "enabled": true
+        },
+        {
+          "type": "NormalRule",
+          "name": "Орієнтація нормалей",
+          "tolerance": 1e-12,
+          "enabled": true
+        }
+      ],
+      "models": [
+        {
+          "name": "1 model mouse.obj",
+          "file_path": "test_models/1 model mouse.obj",
+          "analyzed": false,
+          "vertex_count": 0,
+          "face_count": 0,
+          "issues": []
+        },
+        {
+          "name": "6 model cube.obj",
+          "file_path": "test_models/6 model cube.obj",
+          "analyzed": false,
+          "vertex_count": 0,
+          "face_count": 0,
+          "issues": []
+        },
+        {
+          "name": "Catan.obj",
+          "file_path": "test_models/Catan.obj",
+          "analyzed": false,
+          "vertex_count": 0,
+          "face_count": 0,
+          "issues": []
+        },
+        {
+          "name": "Keyboard.obj",
+          "file_path": "test_models/Keyboard.obj",
+          "analyzed": false,
+          "vertex_count": 0,
+          "face_count": 0,
+          "issues": []
+        },
+        {
+          "name": "model 3 can normals.obj",
+          "file_path": "test_models/model 3 can normals.obj",
+          "analyzed": false,
+          "vertex_count": 0,
+          "face_count": 0,
+          "issues": []
+        },
+        {
+          "name": "model 8 clock flipped normals_dublicates.obj",
+          "file_path": "test_models/model 8 clock flipped normals_dublicates.obj",
+          "analyzed": false,
+          "vertex_count": 0,
+          "face_count": 0,
+          "issues": []
+        },
+        {
+          "name": "Radio.obj",
+          "file_path": "test_models/Radio.obj",
+          "analyzed": false,
+          "vertex_count": 0,
+          "face_count": 0,
+          "issues": []
+        },
+        {
+          "name": "Table.obj",
+          "file_path": "test_models/Table.obj",
+          "analyzed": false,
+          "vertex_count": 0,
+          "face_count": 0,
+          "issues": []
+        },
+        {
+          "name": "Wardrobe.obj",
+          "file_path": "test_models/Wardrobe.obj",
+          "analyzed": false,
+          "vertex_count": 0,
+          "face_count": 0,
+          "issues": []
+        },
+        {
+          "name": "aphex_twin.obj",
+          "file_path": "test_models/aphex_twin.obj",
+          "analyzed": false,
+          "vertex_count": 0,
+          "face_count": 0,
+          "issues": []
+        }
+      ]
     }
   ]
 }
