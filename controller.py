@@ -1,4 +1,3 @@
-# ШІ: Контролер MVC для координації фонового парсингу OBJ (threading.Thread) та паралельної перевірки правил (ProcessPoolExecutor). Змінено: додано маркування авторства та синхронізовано з оновленим DegenerateFaceRule.
 import json
 import logging
 import math
