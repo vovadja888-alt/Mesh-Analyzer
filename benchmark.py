@@ -1,4 +1,3 @@
-import math
 import os
 import sys
 import time
@@ -11,16 +10,9 @@ from domain_classes import (
     Issue,
     Model3D,
     NormalRule,
+    build_parallel_tasks,
     validate_model_chunk_worker,
 )
-
-
-def _split_ranges(total: int, parts: int) -> list[tuple[int, int]]:
-    if total <= 0:
-        return [(0, 0)]
-    parts = max(1, min(parts, total))
-    step = math.ceil(total / parts)
-    return [(s, min(total, s + step)) for s in range(0, total, step)]
 
 
 def _deduplicate_dicts(raw_issues: list[dict]) -> list[Issue]:
@@ -85,10 +77,7 @@ def run_benchmark(file_path: str, workers: int = 4) -> None:
         NormalRule(tolerance=1e-12, enabled=True),
     ]
     rules_cfg = [r.to_dict() for r in rules]
-
-    v_ranges = _split_ranges(len(verts), workers)
-    f_ranges = _split_ranges(len(faces), workers)
-    chunks = max(len(v_ranges), len(f_ranges))
+    tasks = build_parallel_tasks(verts, faces, rules_cfg, workers)
 
     # 1. Однопотоковий режим (T1) — класичний ООП-виклик model.validate(rules) -> rule.check()
     model_single = Model3D(name="benchmark_single", file_path=file_path, raw_data=raw)
@@ -100,21 +89,7 @@ def run_benchmark(file_path: str, workers: int = 4) -> None:
     t0 = time.perf_counter()
     raw_threads: list[dict] = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = []
-        for i in range(chunks):
-            v_start, v_end = v_ranges[i] if i < len(v_ranges) else (0, 0)
-            f_start, f_end = f_ranges[i] if i < len(f_ranges) else (0, 0)
-            futs.append(
-                ex.submit(
-                    validate_model_chunk_worker,
-                    verts[v_start:v_end],
-                    faces[f_start:f_end],
-                    verts if f_start < f_end else [],
-                    v_start,
-                    f_start,
-                    rules_cfg,
-                )
-            )
+        futs = [ex.submit(validate_model_chunk_worker, *task) for task in tasks]
         for f in as_completed(futs):
             raw_threads.extend(f.result())
     res_threads = _deduplicate_dicts(raw_threads)
@@ -124,21 +99,7 @@ def run_benchmark(file_path: str, workers: int = 4) -> None:
     t0 = time.perf_counter()
     raw_procs: list[dict] = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = []
-        for i in range(chunks):
-            v_start, v_end = v_ranges[i] if i < len(v_ranges) else (0, 0)
-            f_start, f_end = f_ranges[i] if i < len(f_ranges) else (0, 0)
-            futs.append(
-                ex.submit(
-                    validate_model_chunk_worker,
-                    verts[v_start:v_end],
-                    faces[f_start:f_end],
-                    verts if f_start < f_end else [],
-                    v_start,
-                    f_start,
-                    rules_cfg,
-                )
-            )
+        futs = [ex.submit(validate_model_chunk_worker, *task) for task in tasks]
         for f in as_completed(futs):
             raw_procs.extend(f.result())
     res_procs = _deduplicate_dicts(raw_procs)
