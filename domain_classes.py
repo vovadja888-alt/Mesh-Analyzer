@@ -108,10 +108,12 @@ class DuplicateVertexRule(ValidationRule):
         super().__init__(name="Дублікати вершин", tolerance=tolerance, enabled=enabled)
 
     def check(self, model: "Model3D") -> list[Issue]:
-        if not self.enabled:
+        if not self.enabled or not model.vertices:
             return []
         verts = model.get_raw_vertices()
-        dups = math_logic.find_duplicate_vertices(verts, tolerance=self.tolerance)
+        dups = math_logic.find_duplicate_vertices(
+            verts, tolerance=self.tolerance, index_offset=model.vertex_offset
+        )
         return [
             Issue(
                 index=idx,
@@ -129,12 +131,12 @@ class DegenerateFaceRule(ValidationRule):
         super().__init__(name="Вироджені та n-гони", tolerance=tolerance, enabled=enabled)
 
     def check(self, model: "Model3D") -> list[Issue]:
-        if not self.enabled:
+        if not self.enabled or not model.faces:
             return []
-        verts = model.get_raw_vertices()
+        lookup_verts = model.get_lookup_vertices()
         faces = model.get_raw_faces()
         zeros, non_quads = math_logic.find_degenerate_and_non_quad_faces(
-            verts, faces, zero_tolerance=self.tolerance
+            lookup_verts, faces, zero_tolerance=self.tolerance, index_offset=model.face_offset
         )
         issues = [
             Issue(
@@ -152,7 +154,7 @@ class DegenerateFaceRule(ValidationRule):
                 error_type="NOT_QUAD",
                 rule_name=self.name,
                 severity="Info",
-                description=f"Нечотирикутний полігон #{idx} ({len(faces[idx])} вершин)",
+                description=f"Нечотирикутний полігон #{idx} ({len(faces[idx - model.face_offset])} вершин)",
             )
             for idx in non_quads
         )
@@ -164,12 +166,12 @@ class NormalRule(ValidationRule):
         super().__init__(name="Орієнтація нормалей", tolerance=tolerance, enabled=enabled)
 
     def check(self, model: "Model3D") -> list[Issue]:
-        if not self.enabled:
+        if not self.enabled or not model.faces:
             return []
-        verts = model.get_raw_vertices()
+        lookup_verts = model.get_lookup_vertices()
         faces = model.get_raw_faces()
         zeros, flipped = math_logic.find_normals_issues_bfs(
-            verts, faces, zero_tolerance=self.tolerance
+            lookup_verts, faces, zero_tolerance=self.tolerance, index_offset=model.face_offset
         )
         issues = [
             Issue(
@@ -215,6 +217,9 @@ class Model3D(Reportable):
         self.analyzed = analyzed
         self._cached_vertex_count = vertex_count
         self._cached_face_count = face_count
+        self.vertex_offset: int = 0
+        self.face_offset: int = 0
+        self._lookup_vertices: list[tuple[float, float, float]] | None = None
 
         if raw_data is not None:
             self.load_geometry(raw_data)
@@ -226,6 +231,35 @@ class Model3D(Reportable):
         self.faces = [Face(i, tuple(f)) for i, f in enumerate(raw_faces)]
         self._cached_vertex_count = len(self.vertices)
         self._cached_face_count = len(self.faces)
+        self.vertex_offset = 0
+        self.face_offset = 0
+        self._lookup_vertices = None
+
+    @classmethod
+    def from_chunk(
+        cls,
+        chunk_vertices: list[tuple[float, float, float]],
+        chunk_faces: list[tuple[int, ...]],
+        lookup_vertices: list[tuple[float, float, float]],
+        vertex_offset: int = 0,
+        face_offset: int = 0,
+    ) -> "Model3D":
+        """Створює ізольований сегмент моделі (чанк) для паралельної перевірки у воркері."""
+        chunk = cls(name="chunk", file_path="")
+        chunk.vertex_offset = vertex_offset
+        chunk.face_offset = face_offset
+        chunk._lookup_vertices = lookup_vertices
+        chunk.vertices = [
+            Vertex(vertex_offset + i, v[0], v[1], v[2])
+            for i, v in enumerate(chunk_vertices)
+        ]
+        chunk.faces = [
+            Face(face_offset + i, tuple(f))
+            for i, f in enumerate(chunk_faces)
+        ]
+        chunk._cached_vertex_count = len(chunk.vertices)
+        chunk._cached_face_count = len(chunk.faces)
+        return chunk
 
     @property
     def vertex_count(self) -> int:
@@ -238,10 +272,16 @@ class Model3D(Reportable):
     def get_raw_vertices(self) -> list[tuple[float, float, float]]:
         return [v.as_tuple() for v in self.vertices]
 
+    def get_lookup_vertices(self) -> list[tuple[float, float, float]]:
+        if self._lookup_vertices is not None:
+            return self._lookup_vertices
+        return self.get_raw_vertices()
+
     def get_raw_faces(self) -> list[tuple[int, ...]]:
         return [f.vertex_indices for f in self.faces]
 
     def validate(self, rules: list[ValidationRule]) -> list[Issue]:
+        """Поліморфний запуск усіх активних правил через виклик rule.check(self)."""
         all_issues: list[Issue] = []
         for rule in rules:
             if rule.enabled:
@@ -310,6 +350,31 @@ class Model3D(Reportable):
             face_count=int(data.get("face_count", 0)),
             issues=[Issue.from_dict(x) for x in data.get("issues", [])],
         )
+
+
+def validate_model_chunk_worker(
+    chunk_vertices: list[tuple[float, float, float]],
+    chunk_faces: list[tuple[int, ...]],
+    lookup_vertices: list[tuple[float, float, float]],
+    vertex_offset: int,
+    face_offset: int,
+    rules_config: list[dict],
+) -> list[dict]:
+    """
+    Функція-воркер для ProcessPoolExecutor: приймає виділений сегмент геометрії,
+    створює об'єкт Model3D.from_chunk та поліморфно викликає rule.check()
+    через chunk_model.validate(rules).
+    """
+    chunk_model = Model3D.from_chunk(
+        chunk_vertices=chunk_vertices,
+        chunk_faces=chunk_faces,
+        lookup_vertices=lookup_vertices,
+        vertex_offset=vertex_offset,
+        face_offset=face_offset,
+    )
+    rules = [ValidationRule.from_dict(cfg) for cfg in rules_config]
+    issues = chunk_model.validate(rules)
+    return [iss.to_dict() for iss in issues]
 
 
 class Project:
