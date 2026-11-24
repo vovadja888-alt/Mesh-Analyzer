@@ -168,8 +168,20 @@ class NormalRule(ValidationRule):
             return []
         verts = model.get_raw_vertices()
         faces = model.get_raw_faces()
-        flipped = math_logic.find_flipped_normals_bfs(verts, faces, zero_tolerance=self.tolerance)
-        return [
+        zeros, flipped = math_logic.find_normals_issues_bfs(
+            verts, faces, zero_tolerance=self.tolerance
+        )
+        issues = [
+            Issue(
+                index=idx,
+                error_type="ZERO_NORMAL",
+                rule_name=self.name,
+                severity="Critical",
+                description=f"Нульова нормаль грані #{idx} (допуск {self.tolerance:g})",
+            )
+            for idx in zeros
+        ]
+        issues.extend(
             Issue(
                 index=idx,
                 error_type="FLIPPED_NORMAL",
@@ -178,7 +190,8 @@ class NormalRule(ValidationRule):
                 description=f"Інвертована нормаль грані #{idx} (допуск {self.tolerance:g})",
             )
             for idx in flipped
-        ]
+        )
+        return issues
 
 
 class Model3D(Reportable):
