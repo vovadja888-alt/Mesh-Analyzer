@@ -1,6 +1,5 @@
 import json
 import logging
-import math
 import os
 import queue
 import threading
@@ -16,16 +15,9 @@ from domain_classes import (
     Project,
     ProjectStorage,
     ValidationRule,
+    build_parallel_tasks,
     validate_model_chunk_worker,
 )
-
-
-def _split_ranges(total: int, parts: int) -> list[tuple[int, int]]:
-    if total <= 0:
-        return [(0, 0)]
-    parts = max(1, min(parts, total))
-    step = math.ceil(total / parts)
-    return [(start, min(total, start + step)) for start in range(0, total, step)]
 
 
 def _batch_model_worker(model_name: str, file_path: str, rules_cfg: list[dict]) -> dict:
@@ -199,36 +191,24 @@ class MeshAnalyzerController:
             if len(verts) < 2000 and len(faces) < 2000:
                 workers_count = 1
 
-            if workers_count == 1:
+            tasks = build_parallel_tasks(verts, faces, rules_cfg, workers_count)
+
+            if workers_count == 1 or len(tasks) <= 1:
                 self.result_queue.put(("progress", 0.55, "Перевірка геометрії моделі..."))
                 rules = [ValidationRule.from_dict(cfg) for cfg in rules_cfg]
                 model_obj.validate(rules)
             else:
-                v_ranges = _split_ranges(len(verts), workers_count)
-                f_ranges = _split_ranges(len(faces), workers_count)
-                chunks_total = max(len(v_ranges), len(f_ranges))
-
+                chunks_total = len(tasks)
                 self.result_queue.put(
-                    ("progress", 0.50, f"Паралельна перевірка {chunks_total} частин моделі ({workers_count} проц.)...")
+                    ("progress", 0.50, f"Паралельна перевірка {chunks_total} сегментів моделі ({workers_count} проц.)...")
                 )
 
                 collected_dicts: list[dict] = []
                 with ProcessPoolExecutor(max_workers=workers_count) as executor:
-                    futures = []
-                    for i in range(chunks_total):
-                        v_start, v_end = v_ranges[i] if i < len(v_ranges) else (0, 0)
-                        f_start, f_end = f_ranges[i] if i < len(f_ranges) else (0, 0)
-                        futures.append(
-                            executor.submit(
-                                validate_model_chunk_worker,
-                                verts[v_start:v_end],
-                                faces[f_start:f_end],
-                                verts if f_start < f_end else [],
-                                v_start,
-                                f_start,
-                                rules_cfg,
-                            )
-                        )
+                    futures = [
+                        executor.submit(validate_model_chunk_worker, *task)
+                        for task in tasks
+                    ]
 
                     done_cnt = 0
                     for fut in as_completed(futures):
@@ -239,7 +219,7 @@ class MeshAnalyzerController:
                         collected_dicts.extend(fut.result())
                         done_cnt += 1
                         pct = 0.50 + 0.45 * (done_cnt / chunks_total)
-                        self.result_queue.put(("progress", pct, f"Оброблено частин моделі: {done_cnt}/{chunks_total}"))
+                        self.result_queue.put(("progress", pct, f"Оброблено сегментів моделі: {done_cnt}/{chunks_total}"))
 
                 model_obj.set_issues_deduplicated([Issue.from_dict(d) for d in collected_dicts])
 
