@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
@@ -370,6 +371,42 @@ class Model3D(Reportable):
             face_count=int(data.get("face_count", 0)),
             issues=[Issue.from_dict(x) for x in issues_raw],
         )
+
+
+def build_parallel_tasks(
+    verts: list[tuple[float, float, float]],
+    faces: list[tuple[int, ...]],
+    rules_cfg: list[dict],
+    workers_count: int,
+) -> list[tuple]:
+    """
+    Формує задачі для паралельних воркерів без розриву глобальних структур даних:
+    - DuplicateVertexRule отримує повний масив вершин (цілісна просторова сітка);
+    - NormalRule отримує повний масив граней (цілісний граф зв'язності BFS);
+    - DegenerateFaceRule розбивається на незалежні чанки граней між рештою воркерів.
+    """
+    tasks: list[tuple] = []
+    deg_cfgs: list[dict] = []
+
+    for cfg in rules_cfg:
+        if not cfg.get("enabled", True):
+            continue
+        r_type = cfg.get("type")
+        if r_type == "DuplicateVertexRule":
+            tasks.append((verts, [], [], 0, 0, [cfg]))
+        elif r_type == "NormalRule":
+            tasks.append(([], faces, verts, 0, 0, [cfg]))
+        elif r_type == "DegenerateFaceRule":
+            deg_cfgs.append(cfg)
+
+    if deg_cfgs and faces:
+        parts = max(1, min(len(faces), max(1, workers_count - len(tasks))))
+        step = math.ceil(len(faces) / parts)
+        for f_start in range(0, len(faces), step):
+            f_end = min(len(faces), f_start + step)
+            tasks.append(([], faces[f_start:f_end], verts, 0, f_start, deg_cfgs))
+
+    return tasks
 
 
 def validate_model_chunk_worker(
