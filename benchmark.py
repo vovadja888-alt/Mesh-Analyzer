@@ -3,14 +3,35 @@ import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-import math_logic
 import obj_parser
+from domain_classes import (
+    DegenerateFaceRule,
+    DuplicateVertexRule,
+    Issue,
+    Model3D,
+    NormalRule,
+    validate_model_chunk_worker,
+)
 
 
 def _split_ranges(total: int, parts: int) -> list[tuple[int, int]]:
+    if total <= 0:
+        return [(0, 0)]
     parts = max(1, min(parts, total))
     step = math.ceil(total / parts)
     return [(s, min(total, s + step)) for s in range(0, total, step)]
+
+
+def _deduplicate_dicts(raw_issues: list[dict]) -> list[Issue]:
+    seen: set[tuple[str, int]] = set()
+    unique: list[Issue] = []
+    for d in raw_issues:
+        iss = Issue.from_dict(d)
+        key = (iss.error_type, iss.index)
+        if key not in seen:
+            seen.add(key)
+            unique.append(iss)
+    return unique
 
 
 def run_benchmark(file_path: str, workers: int = 4) -> None:
@@ -24,57 +45,69 @@ def run_benchmark(file_path: str, workers: int = 4) -> None:
     faces = raw["faces"]
     print(f"Вершин: {len(verts):,} | Граней: {len(faces):,} | Виконавців (частин моделі): n = {workers}\n")
 
-    rules_cfg = [
-        {"type": "DuplicateVertexRule", "name": "Дублікати вершин", "tolerance": 1e-6, "enabled": True},
-        {"type": "DegenerateFaceRule", "name": "Вироджені та n-гони", "tolerance": 1e-12, "enabled": True},
-        {"type": "NormalRule", "name": "Орієнтація нормалей", "tolerance": 1e-12, "enabled": True},
+    rules = [
+        DuplicateVertexRule(tolerance=1e-6, enabled=True),
+        DegenerateFaceRule(tolerance=1e-12, enabled=True),
+        NormalRule(tolerance=1e-12, enabled=True),
     ]
+    rules_cfg = [r.to_dict() for r in rules]
 
     v_ranges = _split_ranges(len(verts), workers)
     f_ranges = _split_ranges(len(faces), workers)
     chunks = max(len(v_ranges), len(f_ranges))
 
-    # 1. Однопотоковий режим (T1)
+    # 1. Однопотоковий режим (T1) — класичний ООП-виклик model.validate(rules) -> rule.check()
+    model_single = Model3D(name="benchmark_single", file_path=file_path, raw_data=raw)
     t0 = time.perf_counter()
-    res_single = math_logic.validate_model_chunk_worker(verts, faces, (0, len(verts)), (0, len(faces)), rules_cfg)
+    res_single = model_single.validate(rules)
     t1 = time.perf_counter() - t0
 
-    # 2. ThreadPoolExecutor (перевірка частин моделі у потоках)
+    # 2. ThreadPoolExecutor (перевірка виділених сегментів моделі у потоках через rule.check())
     t0 = time.perf_counter()
-    res_threads = []
+    raw_threads: list[dict] = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [
-            ex.submit(
-                math_logic.validate_model_chunk_worker,
-                verts,
-                faces,
-                v_ranges[i] if i < len(v_ranges) else (0, 0),
-                f_ranges[i] if i < len(f_ranges) else (0, 0),
-                rules_cfg,
+        futs = []
+        for i in range(chunks):
+            v_start, v_end = v_ranges[i] if i < len(v_ranges) else (0, 0)
+            f_start, f_end = f_ranges[i] if i < len(f_ranges) else (0, 0)
+            futs.append(
+                ex.submit(
+                    validate_model_chunk_worker,
+                    verts[v_start:v_end],
+                    faces[f_start:f_end],
+                    verts if f_start < f_end else [],
+                    v_start,
+                    f_start,
+                    rules_cfg,
+                )
             )
-            for i in range(chunks)
-        ]
         for f in as_completed(futs):
-            res_threads.extend(f.result())
+            raw_threads.extend(f.result())
+    res_threads = _deduplicate_dicts(raw_threads)
     t_thread = time.perf_counter() - t0
 
-    # 3. ProcessPoolExecutor (перевірка частин моделі у процесах)
+    # 3. ProcessPoolExecutor (перевірка виділених сегментів моделі у процесах через rule.check())
     t0 = time.perf_counter()
-    res_procs = []
+    raw_procs: list[dict] = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = [
-            ex.submit(
-                math_logic.validate_model_chunk_worker,
-                verts,
-                faces,
-                v_ranges[i] if i < len(v_ranges) else (0, 0),
-                f_ranges[i] if i < len(f_ranges) else (0, 0),
-                rules_cfg,
+        futs = []
+        for i in range(chunks):
+            v_start, v_end = v_ranges[i] if i < len(v_ranges) else (0, 0)
+            f_start, f_end = f_ranges[i] if i < len(f_ranges) else (0, 0)
+            futs.append(
+                ex.submit(
+                    validate_model_chunk_worker,
+                    verts[v_start:v_end],
+                    faces[f_start:f_end],
+                    verts if f_start < f_end else [],
+                    v_start,
+                    f_start,
+                    rules_cfg,
+                )
             )
-            for i in range(chunks)
-        ]
         for f in as_completed(futs):
-            res_procs.extend(f.result())
+            raw_procs.extend(f.result())
+    res_procs = _deduplicate_dicts(raw_procs)
     t_proc = time.perf_counter() - t0
 
     print(f"1. Однопотоковий режим (T1):   {t1:.4f} с | Помилок: {len(res_single)} | S = 1.00x")
